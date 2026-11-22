@@ -294,3 +294,32 @@ fn worker_gets_its_own_worktree() {
         .is_err()
     );
 }
+
+#[test]
+fn rm_cancels_items_and_moves_the_bot_to_trash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = Daemon::start(tmp.path());
+    d.cli(&["new", "gone"]).unwrap();
+    d.until("bot loaded", || {
+        !d.status()["bots"].as_array().unwrap().is_empty()
+    });
+    d.cli(&["pause", "gone"]).unwrap();
+    let filed: Value = serde_json::from_str(&d.cli(&["ask", "gone", "later"]).unwrap()).unwrap();
+    let id = filed["id"].as_i64().unwrap();
+    std::fs::write(d.root.join("bots/gone/MEMORY.md"), "- keep me\n").unwrap();
+
+    let out: Value = serde_json::from_str(&d.cli(&["rm", "gone"]).unwrap()).unwrap();
+    assert_eq!(out["canceled_items"], 1);
+    assert_eq!(d.item(id)["status"], "canceled");
+    assert!(!d.root.join("bots/gone").exists());
+    let trash = PathBuf::from(out["trash"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(trash.join("MEMORY.md")).unwrap(),
+        "- keep me\n"
+    );
+    assert!(d.status()["bots"].as_array().unwrap().is_empty());
+    assert!(d.cli(&["rm", "gone"]).is_err(), "already gone");
+    assert!(d.cli(&["rm", "../etc"]).is_err(), "not a bot id");
+    // The same name can be used again.
+    d.cli(&["new", "gone"]).unwrap();
+}

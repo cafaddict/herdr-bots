@@ -5,6 +5,7 @@
 //   { chat: true }     the right-hand panel (beside Files/Changes): the bot in shared "bots.chat"
 //   { chat: "<bot>" }  the same conversation as a window, for layouts without that panel
 //   { newBot: true }   the "new bot" dialog
+//   { deleteBot: id }  the "delete bot?" dialog
 //   (none)             everything at once, as a window (`mod.open bots`)
 //
 // The daemon writes ~/.herdr-bots/state/status.json on every change; this mod watches that
@@ -58,10 +59,11 @@ function openNewBot() {
 export default class Bots extends View {
   init(_props, cx) {
     const p = props() ?? {};
-    this.mode = p.titlebar ? "titlebar" : p.newBot ? "new" : p.chat ? "chat" : p.sidebar ? "sidebar" : "full";
+    this.mode = p.titlebar ? "titlebar" : p.newBot ? "new" : p.deleteBot ? "delete" : p.chat ? "chat" : p.sidebar ? "sidebar" : "full";
     this.inPanel = p.chat === true; // follows shared "bots.chat" instead of a fixed bot
     if (this.mode === "titlebar") return; // a terminal window's title bar needs no data
     if (this.mode === "new") return this.initNew(cx);
+    if (this.mode === "delete") return this.initDelete(cx);
     this.snap = null;
     this.error = null;
     this.selected = this.inPanel ? (shared("bots.chat") ?? null) : (p.chat ?? null);
@@ -146,6 +148,7 @@ export default class Bots extends View {
       case "sidebar": return this.renderSidebar(t);
       case "chat": return this.renderChat(t);
       case "new": return this.renderNew(t);
+      case "delete": return this.renderDelete(t);
       default: return this.renderFull(t);
     }
   }
@@ -220,7 +223,8 @@ export default class Bots extends View {
       .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).truncate().child(bot ? `${bot.agent} · ${bot.permission}` : ""))
       .when(Boolean(bot), (el) => el
         .child(this.button(t, "chat-pause", bot.paused ? "Resume" : "Pause", (cx) => this.run(cx, [bot.paused ? "resume" : "pause", bot.id])))
-        .child(this.button(t, "chat-term", "Terminal", () => this.openTerminal(bot.id))))
+        .child(this.button(t, "chat-term", "Terminal", () => this.openTerminal(bot.id)))
+        .child(this.button(t, "chat-delete", "Delete", () => openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { deleteBot: bot.id } }))))
       .when(!this.selected, (el) => el.child(this.button(t, "chat-new", "+ New bot", () => openNewBot())))
       .child(this.closeButton(t));
     if (!this.snap) return root.child(header).child(div().p(12).text_color(t.muted).child(checking() ? "" : "herdr-bots isn't running."));
@@ -305,6 +309,67 @@ export default class Bots extends View {
       .hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click(() => (this.inPanel ? run("layout.hide", { id: "panel" }) : closeOverlay(props().overlay))).child("✕");
+  }
+
+  // ---------- delete bot dialog ----------
+
+  initDelete(cx) {
+    this.target = props().deleteBot;
+    this.force = false;
+    this.busy = false;
+    this.error = null;
+    this.workers = 0;
+    this.handle = cx.focus_handle();
+    if (checking()) return;
+    cx.timer.after(100, () => this.handle.focus());
+    cx.spawn(async (cx) => {
+      const text = await readTextFile(`${stateDir()}/status.json`).catch(() => null);
+      try {
+        const snap = JSON.parse(text ?? "{}");
+        this.workers = (snap.workers ?? []).filter((w) => w.bot === this.target && w.status === "running").length;
+      } catch { /* shown without the worker count */ }
+      cx.notify();
+    });
+  }
+
+  remove(cx) {
+    if (this.busy) return;
+    if (this.workers && !this.force) { this.error = "Tick the box to stop its workers too."; cx.notify(); return; }
+    this.busy = true;
+    const args = ["rm", this.target];
+    if (this.force) args.push("--force");
+    cx.spawn(async (cx) => {
+      const r = await exec(BIN, args).catch((e) => ({ code: 1, stderr: String(e) }));
+      this.busy = false;
+      if (r.code !== 0) { this.error = (r.stderr || r.stdout || "failed").trim(); cx.notify(); return; }
+      if (shared("bots.chat") === this.target) setShared("bots.chat", null);
+      closeOverlay(props().overlay);
+      notify({ title: `Deleted ${this.target}`, body: "Its folder is in ~/.herdr-bots/trash.", level: "info" });
+    });
+  }
+
+  renderDelete(t) {
+    const line = (text) => div().text_size(12.5).text_color(t.muted).whitespace_normal().child(text);
+    return v_flex().id("bots-delete").track_focus(this.handle)
+      .on_key_down((e, cx) => {
+        if (e.key === "escape") { closeOverlay(props().overlay); cx.stop_propagation(); }
+        else if (e.key === "enter") { this.remove(cx); cx.stop_propagation(); }
+      })
+      .w_full().p(18).gap(8).bg(t.popover).text_color(t.foreground)
+      .child(div().text_size(15).font_semibold().child(`Delete ${this.target}?`))
+      .child(line("Its open items are canceled and its agent's terminal ends."))
+      .child(line("Its folder (SOUL.md, MEMORY.md, bot.toml) moves to ~/.herdr-bots/trash, so you can bring it back."))
+      .when(this.workers > 0, (el) => el.child(h_flex().id("del-force").gap(8).pt(4).items_center().cursor_pointer()
+        .on_click((_e, cx) => { this.force = !this.force; this.error = null; cx.notify(); })
+        .child(div().w(16).h(16).rounded(4).border_1().border_color(this.force ? t.blocked : t.input)
+          .bg(this.force ? t.blocked : t.background).text_size(11).text_color(t.background).child(this.force ? "✓" : ""))
+        .child(div().text_size(12.5).child(`Also stop its ${this.workers} running worker${this.workers > 1 ? "s" : ""} (worktrees are kept)`))))
+      .when(Boolean(this.error), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.error)))
+      .child(h_flex().pt(12).gap(8).justify_end()
+        .child(this.button(t, "del-cancel", "Cancel", () => closeOverlay(props().overlay)))
+        .child(div().id("del-yes").px(10).py(4).rounded(6).text_size(12).cursor_pointer().bg(t.blocked).text_color(t.background)
+          .hover((s) => s.opacity(0.85)).on_click((_e, cx) => this.remove(cx))
+          .child(this.busy ? "Deleting…" : "Delete")));
   }
 
   // ---------- new bot dialog ----------

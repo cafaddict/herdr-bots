@@ -86,6 +86,13 @@ enum Command {
         #[arg(long)]
         summary: String,
     },
+    /// Delete a bot: cancel its open items, end its terminal, move its folder to ~/.herdr-bots/trash.
+    Rm {
+        bot: String,
+        /// Also stop its running workers (their worktrees are kept).
+        #[arg(long)]
+        force: bool,
+    },
     /// Register the daemon with launchd (macOS) or systemd --user (Linux) and start it.
     InstallService,
     UninstallService,
@@ -204,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 Command::WorkerDone { name, pr, summary } => {
                     Request::WorkerDone { name, pr, summary }
                 }
+                Command::Rm { bot, force } => Request::Remove { bot, force },
                 _ => unreachable!("handled above"),
             };
             let data = ipc::call(&paths.socket(), &req).await?;

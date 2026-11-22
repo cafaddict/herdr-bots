@@ -91,6 +91,17 @@ team = "ENG"
 allow_authors = ["teammate"]  # who may trigger this bot from GitHub/Linear
 ```
 
+To delete a bot, click **Delete** in its chat, or run `herdr-bots rm <id>`. Deleting does three
+things:
+
+- Cancels the bot's open items.
+- Ends its agent's terminal.
+- Moves its folder to `~/.herdr-bots/trash/<id>-<time>`. To bring the bot back, move the folder
+  back into `bots/<id>`.
+
+If the bot has workers running, `rm` refuses. `--force` (or the checkbox in the dialog) stops the
+workers too. Their git worktrees are kept.
+
 The daemon reloads a bot within 5 seconds after you save its `bot.toml`. A broken `bot.toml`
 shows up as an error in the panel and in `herdr-bots status` instead of stopping the daemon.
 
@@ -154,6 +165,7 @@ herdr-bots status [--json]         bots, open items, workers
 herdr-bots ask <bot> <text> [--item N]
 herdr-bots done|cancel <item>
 herdr-bots pause|resume <bot>
+herdr-bots rm <bot> [--force]      delete a bot (its folder goes to ~/.herdr-bots/trash)
 herdr-bots reload
 herdr-bots install-service | uninstall-service
 herdr-bots daemon                  (what the service runs)

@@ -56,6 +56,13 @@ pub enum Request {
         pr: Option<String>,
         summary: String,
     },
+    /// Deletes a bot: cancels its open items, ends its terminal, moves its folder to trash/.
+    /// Refuses while its workers run, unless `force` (then they're stopped too).
+    Remove {
+        bot: String,
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -224,7 +231,66 @@ async fn handle(app: &Arc<App>, req: Request) -> anyhow::Result<Value> {
                 .with_context(|| format!("no worker {name}"))?;
             Ok(serde_json::to_value(w)?)
         }
+        Request::Remove { bot, force } => remove_bot(app, &bot, force).await,
     }
+}
+
+async fn remove_bot(app: &Arc<App>, bot: &str, force: bool) -> anyhow::Result<Value> {
+    anyhow::ensure!(config::valid_bot_id(bot), "no bot `{bot}`");
+    let home = app.paths.bot_home(bot);
+    anyhow::ensure!(home.is_dir(), "no bot `{bot}`");
+
+    let running: Vec<String> = app
+        .store()
+        .workers(true, 1000)?
+        .into_iter()
+        .filter(|w| w.bot == bot)
+        .map(|w| w.name)
+        .collect();
+    anyhow::ensure!(
+        running.is_empty() || force,
+        "{bot} has running workers ({}); stop them first or use --force",
+        running.join(", ")
+    );
+
+    // Stop new turns first, then cancel what's open, then end the processes.
+    app.remove_actor(bot);
+    let mut canceled = 0;
+    {
+        let store = app.store();
+        for status in [Status::Planned, Status::Working, Status::NeedsYou] {
+            for item in store
+                .items_with_status(status)?
+                .into_iter()
+                .filter(|i| i.bot == bot)
+            {
+                store.transition(item.id, Status::Canceled, "bot removed")?;
+                canceled += 1;
+            }
+        }
+        for name in &running {
+            store.finish_worker(name, "failed", None, Some("stopped: its bot was removed"))?;
+        }
+    }
+    for terminal in running.iter().cloned().chain([terminal_name(bot)]) {
+        let _ = app.hc.kill(&terminal).await;
+        let _ = app.hc.rm(&terminal).await;
+    }
+
+    // Kept, not deleted: SOUL.md and MEMORY.md are the bot's history.
+    let trash = app.paths.root().join("trash");
+    std::fs::create_dir_all(&trash)?;
+    let dest = trash.join(format!(
+        "{bot}-{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    ));
+    std::fs::rename(&home, &dest)
+        .with_context(|| format!("move {} to {}", home.display(), dest.display()))?;
+    info!(bot, trash = %dest.display(), canceled, "bot removed");
+    reload(app);
+    Ok(
+        json!({ "removed": bot, "trash": dest, "canceled_items": canceled, "stopped_workers": running }),
+    )
 }
 
 /// Re-reads every bot.toml, rewrites each bot's HERDR-BOTS.md, and starts actors for new bots.

@@ -100,6 +100,14 @@ impl App {
             .insert(bot.into(), tx);
     }
 
+    /// Drops the bot's queue; its actor ends after the turn it's on.
+    pub fn remove_actor(&self, bot: &str) {
+        self.actors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(bot);
+    }
+
     pub fn has_actor(&self, bot: &str) -> bool {
         self.actors
             .lock()
