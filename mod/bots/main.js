@@ -51,6 +51,10 @@ function openChat(bot) {
 
 const BOT_ID = /^[a-z0-9_-]{1,24}$/;
 
+function openNewBot() {
+  openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { newBot: true } });
+}
+
 export default class Bots extends View {
   init(_props, cx) {
     const p = props() ?? {};
@@ -165,7 +169,7 @@ export default class Bots extends View {
           .child("All"))
         .child(div().id("bots-new").text_size(15).text_color(t.dim).cursor_pointer()
           .hover((s) => s.text_color(t.foreground)).tooltip("New bot")
-          .on_click(() => openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { newBot: true } }))
+          .on_click(() => openNewBot())
           .child("+")));
     let body;
     if (!this.snap) {
@@ -207,22 +211,30 @@ export default class Bots extends View {
     }
     const bot = this.snap?.bots.find((b) => b.id === this.selected);
     const root = v_flex().id("bots-chat").size_full().bg(this.inPanel ? t.chrome : t.popover).text_color(t.foreground).text_size(12.5);
+    // In the panel, ‹ goes back to the bot list (where + New bot is); in a window there's no list.
     const header = h_flex().h(40).px(12).gap(6).flex_none().items_center().border_b_1().border_color(t.border)
-      .child(bot ? this.dot(t, bot.paused ? "paused" : bot.state) : div())
-      .child(div().font_semibold().child(this.selected ?? "bot"))
-      .child(div().text_size(11).text_color(t.dim).child(bot ? `${bot.agent} · ${bot.permission}` : ""))
-      .child(div().flex_1())
+      .when(this.inPanel && Boolean(this.selected), (el) => el.child(this.button(t, "chat-back", "‹ Bots", () => setShared("bots.chat", null))))
+      .when(Boolean(bot), (el) => el.child(this.dot(t, bot.paused ? "paused" : bot.state)))
+      .child(div().flex_none().font_semibold().child(this.selected ?? "Bots"))
+      // The details give way first when the panel is narrow; the name never does.
+      .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).truncate().child(bot ? `${bot.agent} · ${bot.permission}` : ""))
       .when(Boolean(bot), (el) => el
         .child(this.button(t, "chat-pause", bot.paused ? "Resume" : "Pause", (cx) => this.run(cx, [bot.paused ? "resume" : "pause", bot.id])))
         .child(this.button(t, "chat-term", "Terminal", () => this.openTerminal(bot.id))))
+      .when(!this.selected, (el) => el.child(this.button(t, "chat-new", "+ New bot", () => openNewBot())))
       .child(this.closeButton(t));
     if (!this.snap) return root.child(header).child(div().p(12).text_color(t.muted).child(checking() ? "" : "herdr-bots isn't running."));
     if (!this.selected) {
       // Opened from the title bar's Bots button with nothing picked yet: offer the bots here.
       const bots = this.snap.bots;
       return root.child(header).child(v_flex().p(8).gap(2)
-        .child(div().px(8).pb(6).text_size(11.5).text_color(t.dim).child(bots.length ? "Pick a bot" : "No bots yet. Use + in the sidebar."))
-        .children(bots.map((b) => this.sidebarRow(t, b))));
+        .child(div().px(8).pb(6).text_size(11.5).text_color(t.dim).child(bots.length ? "Pick a bot" : "No bots yet."))
+        .children(bots.map((b) => this.sidebarRow(t, b)))
+        .child(h_flex().id("chat-new-row").h(34).px(8).gap(8).flex_none().items_center().rounded(6).cursor_pointer()
+          .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_click(() => openNewBot())
+          .child(h_flex().w(14).flex_none().justify_center().child("+"))
+          .child(div().text_size(13).child("New bot"))));
     }
     if (!bot) return root.child(header).child(div().p(12).text_color(t.muted).child(`No bot ${this.selected}.`));
     return root.child(header)

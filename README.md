@@ -43,7 +43,8 @@ git clone https://github.com/cafaddict/herdr-bots && cd herdr-bots
    - The Bots button lives in `tabs-bots`, a copy of Herdr's title bar mod with that one button
      added. `install.sh` makes a fresh copy every time it runs, so rerun it after Herdr updates.
      See `mod/setup_layout.py`.
-   - **+** in the sidebar header makes a new bot.
+   - **+** in the sidebar header makes a new bot. In the Bots panel, **‹ Bots** goes back to
+     the list of bots, which has **+ New bot**.
    `main-bots` is your layout now: Herdr updates to `main` don't reach it. To go back, run
    `herdr-app do layout.switch '{"name":"main"}'`.
 
