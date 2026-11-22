@@ -91,7 +91,7 @@ team = "ENG"
 allow_authors = ["teammate"]  # who may trigger this bot from GitHub/Linear
 ```
 
-To delete a bot, click **Delete** in its chat, or run `herdr-bots rm <id>`. Deleting does three
+To delete a bot, hover it in the Bots list (sidebar or panel) and click **Delete**, click **Delete** in its chat, or run `herdr-bots rm <id>`. Deleting does three
 things:
 
 - Cancels the bot's open items.

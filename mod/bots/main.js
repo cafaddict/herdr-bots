@@ -52,6 +52,10 @@ function openChat(bot) {
 
 const BOT_ID = /^[a-z0-9_-]{1,24}$/;
 
+function openDeleteBot(bot) {
+  openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { deleteBot: bot } });
+}
+
 function openNewBot() {
   openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { newBot: true } });
 }
@@ -193,16 +197,24 @@ export default class Bots extends View {
       : working ? working.title
       : b.planned ? `${b.planned} queued` : b.agent;
     const open = panelShown() && shared("bots.chat") === b.id;
+    const hovered = this.hoveredRow === b.id;
     return h_flex().id(`sb-${b.id}`).h(34).px(8).gap(8).flex_none().items_center().rounded(6).cursor_pointer()
       .when(open, (el) => el.bg(t.selected))
       .hover((s) => s.bg(open ? t.selected : t.hover))
+      .on_hover((on, cx) => { this.hoveredRow = on ? b.id : (this.hoveredRow === b.id ? null : this.hoveredRow); cx.notify(); })
       .on_click(() => openChat(b.id))
       .child(h_flex().w(14).flex_none().justify_center().child(this.dot(t, b.paused ? "paused" : b.state)))
       .child(v_flex().flex_1().min_w(0)
         .child(div().text_size(13).truncate().child(b.id))
         .child(div().text_size(11).truncate().text_color(question ? t.blocked : t.dim).child(sub)))
-      .when(b.needs_you > 0, (el) => el.child(div().flex_none().px(6).rounded_full().bg(t.blocked)
-        .text_size(10.5).text_color(t.background).child(String(b.needs_you))));
+      .when(b.needs_you > 0 && !hovered, (el) => el.child(div().flex_none().px(6).rounded_full().bg(t.blocked)
+        .text_size(10.5).text_color(t.background).child(String(b.needs_you))))
+      // Shown on hover only, so the list stays quiet.
+      .when(hovered, (el) => el.child(div().id(`sb-del-${b.id}`).flex_none().px(6).py(2).rounded(5).text_size(11)
+        .text_color(t.dim).hover((s) => s.bg(t.raised).text_color(t.blocked))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => { cx.stop_propagation(); openDeleteBot(b.id); })
+        .child("Delete")));
   }
 
   // ---------- chat window ----------
@@ -224,7 +236,7 @@ export default class Bots extends View {
       .when(Boolean(bot), (el) => el
         .child(this.button(t, "chat-pause", bot.paused ? "Resume" : "Pause", (cx) => this.run(cx, [bot.paused ? "resume" : "pause", bot.id])))
         .child(this.button(t, "chat-term", "Terminal", () => this.openTerminal(bot.id)))
-        .child(this.button(t, "chat-delete", "Delete", () => openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { deleteBot: bot.id } }))))
+        .child(this.button(t, "chat-delete", "Delete", () => openDeleteBot(bot.id))))
       .when(!this.selected, (el) => el.child(this.button(t, "chat-new", "+ New bot", () => openNewBot())))
       .child(this.closeButton(t));
     if (!this.snap) return root.child(header).child(div().p(12).text_color(t.muted).child(checking() ? "" : "herdr-bots isn't running."));
