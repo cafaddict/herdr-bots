@@ -217,7 +217,13 @@ export default class Bots extends View {
         .child(this.button(t, "chat-term", "Terminal", () => this.openTerminal(bot.id))))
       .child(this.closeButton(t));
     if (!this.snap) return root.child(header).child(div().p(12).text_color(t.muted).child(checking() ? "" : "herdr-bots isn't running."));
-    if (!this.selected) return root.child(header).child(div().p(12).text_color(t.muted).child("Pick a bot in the sidebar."));
+    if (!this.selected) {
+      // Opened from the title bar's Bots button with nothing picked yet: offer the bots here.
+      const bots = this.snap.bots;
+      return root.child(header).child(v_flex().p(8).gap(2)
+        .child(div().px(8).pb(6).text_size(11.5).text_color(t.dim).child(bots.length ? "Pick a bot" : "No bots yet. Use + in the sidebar."))
+        .children(bots.map((b) => this.sidebarRow(t, b))));
+    }
     if (!bot) return root.child(header).child(div().p(12).text_color(t.muted).child(`No bot ${this.selected}.`));
     return root.child(header)
       .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().child(this.renderItems(t, true)).child(this.renderWorkers(t)))

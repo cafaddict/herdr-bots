@@ -36,9 +36,13 @@ git clone https://github.com/cafaddict/herdr-bots && cd herdr-bots
 4. Adds **Bots** to a copy of Herdr's `main` layout called `main-bots` and switches to it.
    Herdr's own layouts are read-only, which is why it works on a copy.
    - The left sidebar gets a list of bots, above Agents.
-   - Clicking a bot opens its chat in the right panel, where Files and Changes open. The chat
-     shows the bot's items, its questions to you, its answers, and a message box. **Terminal**
-     opens the live Claude Code / Codex session.
+   - The title bar gets a **Bots** button next to Files and Changes. It opens the right panel
+     with a bot's chat: its items, its questions to you, its answers, and a message box.
+     Clicking a bot in the sidebar opens the same panel on that bot. **Terminal** opens the live
+     Claude Code / Codex session.
+   - The Bots button lives in `tabs-bots`, a copy of Herdr's title bar mod with that one button
+     added. `install.sh` makes a fresh copy every time it runs, so rerun it after Herdr updates.
+     See `mod/setup_layout.py`.
    - **+** in the sidebar header makes a new bot.
    `main-bots` is your layout now: Herdr updates to `main` don't reach it. To go back, run
    `herdr-app do layout.switch '{"name":"main"}'`.
