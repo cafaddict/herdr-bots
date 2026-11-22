@@ -2,7 +2,9 @@
 //
 // One mod, three shapes (chosen by props):
 //   { sidebar: true }  a compact list for the left sidebar, above Agents; a click opens the chat
-//   { chat: "<bot>" }  one bot's conversation as a window: items, questions, answers, a message box
+//   { chat: true }     the right-hand panel (beside Files/Changes): the bot in shared "bots.chat"
+//   { chat: "<bot>" }  the same conversation as a window, for layouts without that panel
+//   { newBot: true }   the "new bot" dialog
 //   (none)             everything at once, as a window (`mod.open bots`)
 //
 // The daemon writes ~/.herdr-bots/state/status.json on every change; this mod watches that
@@ -12,7 +14,7 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
 import {
   exec, home, checking, readTextFile, watchFolder, terminals, openOverlay, closeOverlay,
-  notify, setBadge, playSound, props, theme, layout,
+  notify, setBadge, playSound, props, theme, layout, run, shared, setShared,
 } from "herdr";
 import { BIN } from "./config.js";
 
@@ -31,18 +33,34 @@ function find(node, id) {
 // The sidebar rail (dragged narrow) shows only status dots, like Agents does.
 const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
 
+// The right-hand panel when the layout has it (install.sh adds it), else a window.
+const PANEL = "bots-chat";
+const panelShown = () => {
+  const panel = find(layout(), "panel"), body = find(layout(), "panel-body");
+  return Boolean(panel && !panel.hidden && body?.active === PANEL);
+};
 function openChat(bot) {
+  if (find(layout(), PANEL)) {
+    setShared("bots.chat", bot);
+    run("layout.select", { stack: "panel-body", child: PANEL });
+    run("layout.show", { id: "panel" });
+    return;
+  }
   openOverlay({ kind: "window", key: `bots-chat-${bot}`, keep: true, width: 440, height: 620, mod: "bots", props: { chat: bot } });
 }
+
+const BOT_ID = /^[a-z0-9_-]{1,24}$/;
 
 export default class Bots extends View {
   init(_props, cx) {
     const p = props() ?? {};
-    this.mode = p.titlebar ? "titlebar" : p.chat ? "chat" : p.sidebar ? "sidebar" : "full";
+    this.mode = p.titlebar ? "titlebar" : p.newBot ? "new" : p.chat ? "chat" : p.sidebar ? "sidebar" : "full";
+    this.inPanel = p.chat === true; // follows shared "bots.chat" instead of a fixed bot
     if (this.mode === "titlebar") return; // a terminal window's title bar needs no data
+    if (this.mode === "new") return this.initNew(cx);
     this.snap = null;
     this.error = null;
-    this.selected = p.chat ?? null;
+    this.selected = this.inPanel ? (shared("bots.chat") ?? null) : (p.chat ?? null);
     this.answering = null; // the needs_you item the message box answers
     this.seenQuestions = new Set();
     this.firstLoad = true;
@@ -123,6 +141,7 @@ export default class Bots extends View {
       case "titlebar": return this.renderTitlebar(t);
       case "sidebar": return this.renderSidebar(t);
       case "chat": return this.renderChat(t);
+      case "new": return this.renderNew(t);
       default: return this.renderFull(t);
     }
   }
@@ -139,10 +158,15 @@ export default class Bots extends View {
     }
     const header = h_flex().px(16).h(41).pt(14).pb(5).flex_none().items_center().justify_between()
       .child(div().text_size(11.5).font_medium().text_color(t.dim).child("Bots"))
-      .child(div().id("bots-all").text_size(11).text_color(t.dim).cursor_pointer()
-        .hover((s) => s.text_color(t.foreground)).tooltip("All bots, items and workers")
-        .on_click(() => openOverlay({ mod: "bots", kind: "window", key: "herdr-bots", width: 360, height: 640 }))
-        .child("All"));
+      .child(h_flex().gap(10).items_center()
+        .child(div().id("bots-all").text_size(11).text_color(t.dim).cursor_pointer()
+          .hover((s) => s.text_color(t.foreground)).tooltip("All bots, items and workers")
+          .on_click(() => openOverlay({ mod: "bots", kind: "window", key: "herdr-bots", width: 360, height: 640 }))
+          .child("All"))
+        .child(div().id("bots-new").text_size(15).text_color(t.dim).cursor_pointer()
+          .hover((s) => s.text_color(t.foreground)).tooltip("New bot")
+          .on_click(() => openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { newBot: true } }))
+          .child("+")));
     let body;
     if (!this.snap) {
       body = div().px(16).text_size(12).text_color(t.dim).child(checking() ? "" : "herdr-bots isn't running. Run herdr-bots install-service.");
@@ -161,8 +185,10 @@ export default class Bots extends View {
       : question ? (question.question ?? question.title)
       : working ? working.title
       : b.planned ? `${b.planned} queued` : b.agent;
+    const open = panelShown() && shared("bots.chat") === b.id;
     return h_flex().id(`sb-${b.id}`).h(34).px(8).gap(8).flex_none().items_center().rounded(6).cursor_pointer()
-      .hover((s) => s.bg(t.hover))
+      .when(open, (el) => el.bg(t.selected))
+      .hover((s) => s.bg(open ? t.selected : t.hover))
       .on_click(() => openChat(b.id))
       .child(h_flex().w(14).flex_none().justify_center().child(this.dot(t, b.paused ? "paused" : b.state)))
       .child(v_flex().flex_1().min_w(0)
@@ -175,8 +201,12 @@ export default class Bots extends View {
   // ---------- chat window ----------
 
   renderChat(t) {
+    if (this.inPanel) {
+      const want = shared("bots.chat") ?? null;
+      if (want !== this.selected) { this.selected = want; this.answering = null; this.error = null; }
+    }
     const bot = this.snap?.bots.find((b) => b.id === this.selected);
-    const root = v_flex().id("bots-chat").size_full().bg(t.popover).text_color(t.foreground).text_size(12.5);
+    const root = v_flex().id("bots-chat").size_full().bg(this.inPanel ? t.chrome : t.popover).text_color(t.foreground).text_size(12.5);
     const header = h_flex().h(40).px(12).gap(6).flex_none().items_center().border_b_1().border_color(t.border)
       .child(bot ? this.dot(t, bot.paused ? "paused" : bot.state) : div())
       .child(div().font_semibold().child(this.selected ?? "bot"))
@@ -187,6 +217,7 @@ export default class Bots extends View {
         .child(this.button(t, "chat-term", "Terminal", () => this.openTerminal(bot.id))))
       .child(this.closeButton(t));
     if (!this.snap) return root.child(header).child(div().p(12).text_color(t.muted).child(checking() ? "" : "herdr-bots isn't running."));
+    if (!this.selected) return root.child(header).child(div().p(12).text_color(t.muted).child("Pick a bot in the sidebar."));
     if (!bot) return root.child(header).child(div().p(12).text_color(t.muted).child(`No bot ${this.selected}.`));
     return root.child(header)
       .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().child(this.renderItems(t, true)).child(this.renderWorkers(t)))
@@ -255,7 +286,71 @@ export default class Bots extends View {
     return div().id("bots-close").px(6).rounded(6).cursor_pointer().text_color(t.muted)
       .hover((s) => s.bg(t.hover))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-      .on_click(() => closeOverlay(props().overlay)).child("✕");
+      .on_click(() => (this.inPanel ? run("layout.hide", { id: "panel" }) : closeOverlay(props().overlay))).child("✕");
+  }
+
+  // ---------- new bot dialog ----------
+
+  initNew(cx) {
+    this.newId = InputState.new({ placeholder: "reviewer" });
+    this.newRole = InputState.new({ placeholder: "Reviews my PRs and summarizes what to fix" });
+    this.newAgent = "claude";
+    this.newPermission = "full-access";
+    this.error = null;
+    this.busy = false;
+    this.newId.on("submit", (_e, cx) => this.create(cx));
+    this.newRole.on("submit", (_e, cx) => this.create(cx));
+    this.newId.on("change", (_e, cx) => cx.notify());
+    this.handle = cx.focus_handle();
+    if (!checking()) cx.timer.after(200, () => this.newId.focus());
+  }
+
+  create(cx) {
+    const id = this.newId.value().trim();
+    if (!BOT_ID.test(id)) { this.error = "Name: 1-24 of a-z 0-9 - _"; cx.notify(); return; }
+    if (this.busy) return;
+    this.busy = true;
+    const args = ["new", id, "--agent", this.newAgent, "--permission", this.newPermission];
+    const role = this.newRole.value().trim();
+    if (role) args.push("--role", role);
+    cx.spawn(async (cx) => {
+      const r = await exec(BIN, args).catch((e) => ({ code: 1, stderr: String(e) }));
+      this.busy = false;
+      if (r.code !== 0) { this.error = (r.stderr || r.stdout || "failed").trim(); cx.notify(); return; }
+      closeOverlay(props().overlay);
+      openChat(id);
+    });
+  }
+
+  renderNew(t) {
+    const label = (text) => div().pt(14).pb(6).text_size(11.5).text_color(t.dim).child(text);
+    const field = (state) => Input.new(state).h(34).px(10).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.8);
+    const choice = (group, value, text) => {
+      const on = this[group] === value;
+      return div().id(`${group}-${value}`).px(10).py(5).rounded(7).text_size(12).cursor_pointer()
+        .border_1().border_color(on ? t.accent : t.input).bg(on ? t.selected : t.raised)
+        .text_color(on ? t.foreground : t.muted)
+        .on_click((_e, cx) => { this[group] = value; cx.notify(); }).child(text);
+    };
+    const id = this.newId.value().trim();
+    const valid = BOT_ID.test(id);
+    return v_flex().id("bots-new").track_focus(this.handle)
+      .on_key_down((e, cx) => { if (e.key === "escape") { closeOverlay(props().overlay); cx.stop_propagation(); } })
+      .w_full().p(18).bg(t.popover).text_color(t.foreground)
+      .child(div().text_size(15).font_semibold().child("New bot"))
+      .child(label("Name (a-z 0-9 - _)")).child(field(this.newId))
+      .child(label("What it's for (goes into SOUL.md; edit it later)")).child(field(this.newRole))
+      .child(label("Agent")).child(h_flex().gap(6).child(choice("newAgent", "claude", "Claude Code")).child(choice("newAgent", "codex", "Codex")))
+      .child(label("Permission")).child(h_flex().gap(6)
+        .child(choice("newPermission", "full-access", "Full access"))
+        .child(choice("newPermission", "accept-edits", "Accept edits"))
+        .child(choice("newPermission", "ask", "Ask")))
+      .when(this.newPermission === "full-access", (el) => el.child(div().pt(6).text_size(11).text_color(t.dim)
+        .child("Runs tools without asking. GitHub/Linear work only comes from people you allow.")))
+      .when(Boolean(this.error), (el) => el.child(div().pt(10).text_size(11.5).text_color(t.blocked).child(this.error)))
+      .child(h_flex().pt(18).gap(8).justify_end()
+        .child(this.button(t, "new-cancel", "Cancel", () => closeOverlay(props().overlay)))
+        .child(this.button(t, "new-create", this.busy ? "Creating…" : "Create", (cx) => this.create(cx), valid)));
   }
 
   dot(t, state) {

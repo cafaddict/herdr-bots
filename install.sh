@@ -27,14 +27,17 @@ else
   echo "note: $app_home not found; skipping the panel (run again after installing Herdr)" >&2
 fi
 
-# Herdr's own layouts are read-only, so the sidebar entry lives in a clone of `main` called
-# `main-bots` (Bots above Agents). Made once; after that it's yours to edit.
+# Herdr's own layouts are read-only, so Bots lives in a clone of `main` called `main-bots`:
+# a list above Agents in the sidebar, and each bot's chat in the right panel beside
+# Files/Changes. The clone is made once; adding the blocks is repeated (and skipped when there).
 if [ -d "$app_home" ] && command -v herdr-app >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
   layout="$app_home/layouts/main-bots.json"
   if [ ! -f "$layout" ]; then
-    echo "==> adding Bots to the sidebar (layout main-bots)"
+    echo "==> making layout main-bots (a copy of Herdr's main)"
     herdr-app do layout.clone '{"name":"main","as":"main-bots"}' >/dev/null
-    python3 - "$layout" <<'PY'
+  fi
+  echo "==> adding Bots to main-bots (sidebar list, right-panel chat)"
+  python3 - "$layout" <<'PY'
 import json, sys
 path = sys.argv[1]
 doc = json.load(open(path))
@@ -46,15 +49,25 @@ def find(node, id):
             hit = find(child, id)
             if hit:
                 return hit
-lists = find(doc.get("root", doc), "sidebar-lists")
-ids = [c.get("id") for c in lists["children"]]
-if "bots" not in ids:
+root = doc.get("root", doc)
+changed = False
+lists = find(root, "sidebar-lists")
+ids = [c.get("id") for c in lists["children"]] if lists else []
+if lists and "bots" not in ids:
     at = ids.index("agents") if "agents" in ids else len(ids)
     lists["children"].insert(at, {"id": "bots", "type": "block", "size": {"px": 160}, "min": 60,
                                   "content": {"mod": "bots", "props": {"sidebar": True}}})
-json.dump(doc, open(path, "w"), indent=2)
+    changed = True
+body = find(root, "panel-body")
+if body and not find(body, "bots-chat"):
+    body["children"].append({"id": "bots-chat", "type": "block",
+                             "content": {"mod": "bots", "props": {"chat": True}}})
+    changed = True
+if not lists or not body:
+    print("note: main-bots has no sidebar-lists/panel-body; add the bots blocks by hand", file=sys.stderr)
+if changed:
+    json.dump(doc, open(path, "w"), indent=2)
 PY
-  fi
   herdr-app do layout.switch '{"name":"main-bots"}' >/dev/null || true
 fi
 

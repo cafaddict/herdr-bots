@@ -33,10 +33,13 @@ git clone https://github.com/cafaddict/herdr-bots && cd herdr-bots
 2. Copies the panel mod to `~/.config/herdr-app/mods/bots`.
 3. Registers the daemon as a service that starts at login and restarts if it dies:
    launchd (`~/Library/LaunchAgents/dev.herdr-bots.plist`) on macOS, `systemd --user` on Linux.
-4. Adds **Bots** to the left sidebar, above Agents. Herdr's own layouts are read-only, so this
-   happens in a copy of `main` called `main-bots`, and Herdr switches to it. Clicking a bot opens
-   its chat window: its items, its questions to you, its answers, and a message box. From the
-   chat window, **Terminal** opens the live Claude Code / Codex session.
+4. Adds **Bots** to a copy of Herdr's `main` layout called `main-bots` and switches to it.
+   Herdr's own layouts are read-only, which is why it works on a copy.
+   - The left sidebar gets a list of bots, above Agents.
+   - Clicking a bot opens its chat in the right panel, where Files and Changes open. The chat
+     shows the bot's items, its questions to you, its answers, and a message box. **Terminal**
+     opens the live Claude Code / Codex session.
+   - **+** in the sidebar header makes a new bot.
    `main-bots` is your layout now: Herdr updates to `main` don't reach it. To go back, run
    `herdr-app do layout.switch '{"name":"main"}'`.
 
@@ -45,8 +48,10 @@ also opens with `herdr-app do mod.open '{"name":"bots"}'`.
 
 ## A bot
 
+Click **+** in the sidebar's Bots header. Or, from a shell:
+
 ```bash
-herdr-bots new scout
+herdr-bots new scout --agent claude --permission full-access --role "Reviews my PRs"
 ```
 
 This creates `~/.herdr-bots/bots/scout/`:

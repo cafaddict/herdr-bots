@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use crate::config::{AgentKind, Permission};
 use crate::store::Item;
 
 /// Rewritten by the daemon on every start (so the `herdr-bots` path stays right). Not for editing.
@@ -39,18 +40,32 @@ pub const CLAUDE_MD: &str = "@HERDR-BOTS.md\n@SOUL.md\n@MEMORY.md\n";
 
 pub const AGENTS_MD: &str = "Before anything else, read HERDR-BOTS.md, SOUL.md and MEMORY.md in this folder and follow them.\n";
 
-pub fn soul_md(bot: &str) -> String {
+pub fn soul_md(bot: &str, role: Option<&str>) -> String {
+    let role = role
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or("a helpful assistant for its owner's work.");
     format!(
-        "# {bot}\n\nWho this bot is and what it does. Edit me.\n\n- Role: a helpful assistant for its owner's work.\n- Tone: short and direct; lead with the answer.\n"
+        "# {bot}\n\nWho this bot is and what it does. Edit me.\n\n- Role: {role}\n- Tone: short and direct; lead with the answer.\n"
     )
 }
 
 pub const MEMORY_MD: &str = "# Memory\n\n";
 
-pub fn bot_toml() -> &'static str {
-    r#"# herdr-bots bot. Every key is optional.
-agent = "claude"              # claude | codex
-permission = "full-access"    # full-access | accept-edits | ask
+pub fn bot_toml(agent: AgentKind, permission: Permission) -> String {
+    let agent = match agent {
+        AgentKind::Claude => "claude",
+        AgentKind::Codex => "codex",
+    };
+    let permission = match permission {
+        Permission::FullAccess => "full-access",
+        Permission::AcceptEdits => "accept-edits",
+        Permission::Ask => "ask",
+    };
+    format!(
+        r#"# herdr-bots bot. Every key is optional.
+agent = "{agent}"              # claude | codex
+permission = "{permission}"    # full-access | accept-edits | ask
 # model = "opus"
 
 # [[schedule]]
@@ -67,6 +82,16 @@ permission = "full-access"    # full-access | accept-edits | ask
 # Who may trigger this bot from GitHub/Linear. Empty = the daemon default (you).
 # allow_authors = []
 "#
+    )
+}
+
+/// What a new bot starts as.
+#[derive(Debug, Clone, Default)]
+pub struct NewBot<'a> {
+    pub agent: AgentKind,
+    pub permission: Permission,
+    /// One line for SOUL.md's role.
+    pub role: Option<&'a str>,
 }
 
 /// The message one turn starts with.
@@ -97,7 +122,7 @@ pub fn turn_message(item: &Item, note: Option<&str>) -> String {
 }
 
 /// Creates a bot's home. Refuses to touch an existing one.
-pub fn create_bot_home(home: &Path, bot: &str) -> std::io::Result<()> {
+pub fn create_bot_home(home: &Path, bot: &str, new: &NewBot<'_>) -> std::io::Result<()> {
     if home.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -106,8 +131,8 @@ pub fn create_bot_home(home: &Path, bot: &str) -> std::io::Result<()> {
     }
     std::fs::create_dir_all(home.join("memory"))?;
     std::fs::create_dir_all(home.join("outbox"))?;
-    std::fs::write(home.join("bot.toml"), bot_toml())?;
-    std::fs::write(home.join("SOUL.md"), soul_md(bot))?;
+    std::fs::write(home.join("bot.toml"), bot_toml(new.agent, new.permission))?;
+    std::fs::write(home.join("SOUL.md"), soul_md(bot, new.role))?;
     std::fs::write(home.join("MEMORY.md"), MEMORY_MD)?;
     std::fs::write(home.join("CLAUDE.md"), CLAUDE_MD)?;
     std::fs::write(home.join("AGENTS.md"), AGENTS_MD)?;
@@ -155,9 +180,25 @@ mod tests {
     fn home_is_created_once() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("b");
-        create_bot_home(&home, "b").unwrap();
-        assert!(home.join("outbox").is_dir() && home.join("SOUL.md").is_file());
-        assert!(create_bot_home(&home, "b").is_err());
+        let new = NewBot {
+            agent: AgentKind::Codex,
+            permission: Permission::Ask,
+            role: Some("reviews PRs"),
+        };
+        create_bot_home(&home, "b", &new).unwrap();
+        assert!(home.join("outbox").is_dir());
+        assert!(
+            std::fs::read_to_string(home.join("SOUL.md"))
+                .unwrap()
+                .contains("- Role: reviews PRs")
+        );
+        // The generated bot.toml parses back to what was asked for.
+        let bot = crate::config::BotConfig::load(&home.join("bot.toml"), "b").unwrap();
+        assert_eq!(
+            (bot.agent, bot.permission),
+            (AgentKind::Codex, Permission::Ask)
+        );
+        assert!(create_bot_home(&home, "b", &new).is_err());
         let rules = rules_md("b", Path::new("/x/herdr-bots"));
         assert!(rules.contains("/x/herdr-bots needs-you"));
     }

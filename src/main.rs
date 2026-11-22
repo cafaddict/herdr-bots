@@ -4,7 +4,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 
-use herdr_bots::config::valid_bot_id;
+use herdr_bots::config::{AgentKind, Permission, valid_bot_id};
 use herdr_bots::ipc::{self, Request};
 use herdr_bots::paths::Paths;
 use herdr_bots::{daemon, service, templates};
@@ -24,6 +24,13 @@ enum Command {
     /// Make a new bot folder in ~/.herdr-bots/bots/<id>.
     New {
         id: String,
+        #[arg(long, value_enum, default_value = "claude")]
+        agent: AgentArg,
+        #[arg(long, value_enum, default_value = "full-access")]
+        permission: PermissionArg,
+        /// One line for SOUL.md: what this bot is for.
+        #[arg(long)]
+        role: Option<String>,
     },
     /// Message a bot. With --item, answers that item's question.
     Ask {
@@ -84,6 +91,38 @@ enum Command {
     UninstallService,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AgentArg {
+    Claude,
+    Codex,
+}
+
+impl From<AgentArg> for AgentKind {
+    fn from(a: AgentArg) -> Self {
+        match a {
+            AgentArg::Claude => AgentKind::Claude,
+            AgentArg::Codex => AgentKind::Codex,
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PermissionArg {
+    FullAccess,
+    AcceptEdits,
+    Ask,
+}
+
+impl From<PermissionArg> for Permission {
+    fn from(p: PermissionArg) -> Self {
+        match p {
+            PermissionArg::FullAccess => Permission::FullAccess,
+            PermissionArg::AcceptEdits => Permission::AcceptEdits,
+            PermissionArg::Ask => Permission::Ask,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -99,7 +138,19 @@ async fn main() -> anyhow::Result<()> {
                 .init();
             daemon::run(paths).await
         }
-        Command::New { id } => new_bot(&paths, &id).await,
+        Command::New {
+            id,
+            agent,
+            permission,
+            role,
+        } => {
+            let new = templates::NewBot {
+                agent: agent.into(),
+                permission: permission.into(),
+                role: role.as_deref(),
+            };
+            new_bot(&paths, &id, &new).await
+        }
         Command::Status { json } => {
             let data = ipc::call(&paths.socket(), &Request::Status).await?;
             if json {
@@ -162,11 +213,11 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn new_bot(paths: &Paths, id: &str) -> anyhow::Result<()> {
+async fn new_bot(paths: &Paths, id: &str, new: &templates::NewBot<'_>) -> anyhow::Result<()> {
     anyhow::ensure!(valid_bot_id(id), "bot ids are 1-24 of a-z 0-9 - _");
     paths.ensure()?;
     let home = paths.bot_home(id);
-    templates::create_bot_home(&home, id)?;
+    templates::create_bot_home(&home, id, new)?;
     println!("made {}", home.display());
     println!("edit SOUL.md (who it is) and bot.toml (agent, permission, schedule, triggers)");
     if ipc::call(&paths.socket(), &Request::Reload).await.is_err() {
