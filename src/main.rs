@@ -111,8 +111,19 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::InstallService => {
             let file = service::install(&paths)?;
-            println!("installed {} and started the daemon", file.display());
-            Ok(())
+            // The service manager starts it asynchronously; don't report success until it answers.
+            for _ in 0..50 {
+                if ipc::call(&paths.socket(), &Request::Ping).await.is_ok() {
+                    println!("installed {} and the daemon is up", file.display());
+                    return Ok(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            anyhow::bail!(
+                "installed {} but the daemon didn't answer within 5 s; see {}",
+                file.display(),
+                paths.logs_dir().join("daemon.log").display()
+            )
         }
         Command::UninstallService => service::uninstall(),
         other => {

@@ -1,12 +1,18 @@
-// Bots: the herdr-bots daemon's bots, their work items and workers, and a chat box.
-// The daemon writes ~/.herdr-bots/state/status.json on every change; this panel watches that
+// Bots: the herdr-bots daemon's bots, their work items and workers.
+//
+// One mod, three shapes (chosen by props):
+//   { sidebar: true }  a compact list for the left sidebar, above Agents; a click opens the chat
+//   { chat: "<bot>" }  one bot's conversation as a window: items, questions, answers, a message box
+//   (none)             everything at once, as a window (`mod.open bots`)
+//
+// The daemon writes ~/.herdr-bots/state/status.json on every change; this mod watches that
 // folder and calls the `herdr-bots` CLI for actions. A bot's live agent opens as a window.
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
 import {
   exec, home, checking, readTextFile, watchFolder, terminals, openOverlay, closeOverlay,
-  notify, setBadge, playSound, props, theme,
+  notify, setBadge, playSound, props, theme, layout,
 } from "herdr";
 import { BIN } from "./config.js";
 
@@ -14,17 +20,33 @@ const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 const stateDir = () => `${home()}/.herdr-bots/state`;
 const terminalOf = (bot) => terminals().find((t) => t.name === `bot-${bot}` && t.state === "live");
 
+function find(node, id) {
+  if (node?.id === id) return node;
+  for (const child of node?.children ?? []) {
+    const found = find(child, id);
+    if (found) return found;
+  }
+  return null;
+}
+// The sidebar rail (dragged narrow) shows only status dots, like Agents does.
+const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
+
+function openChat(bot) {
+  openOverlay({ kind: "window", key: `bots-chat-${bot}`, keep: true, width: 440, height: 620, mod: "bots", props: { chat: bot } });
+}
+
 export default class Bots extends View {
   init(_props, cx) {
-    this.titlebar = props()?.titlebar ?? null;
-    if (this.titlebar) return; // the window title bar copy needs no data
+    const p = props() ?? {};
+    this.mode = p.titlebar ? "titlebar" : p.chat ? "chat" : p.sidebar ? "sidebar" : "full";
+    if (this.mode === "titlebar") return; // a terminal window's title bar needs no data
     this.snap = null;
     this.error = null;
-    this.selected = null;
-    this.answering = null; // a needs_you item id the input answers
+    this.selected = p.chat ?? null;
+    this.answering = null; // the needs_you item the message box answers
     this.seenQuestions = new Set();
     this.firstLoad = true;
-    this.input = InputState.new({ placeholder: "Message a bot…" });
+    this.input = InputState.new({ placeholder: "Message…" });
     this.input.on("submit", (_e, cx) => this.send(cx));
     if (checking()) return;
     this.reload(cx);
@@ -36,6 +58,7 @@ export default class Bots extends View {
     });
     // The folder may not exist until the daemon first starts; poll gently as a fallback.
     cx.timer.every(15000, (cx) => this.reload(cx));
+    if (this.mode === "chat") cx.timer.after(300, () => this.input.focus());
   }
 
   reload(cx) {
@@ -43,8 +66,9 @@ export default class Bots extends View {
       const text = await readTextFile(`${stateDir()}/status.json`).catch(() => null);
       if (!text) { this.snap = null; cx.notify(); return; }
       try { this.snap = JSON.parse(text); } catch { return; } // mid-write; the next change rereads
-      if (!this.selected || !this.snap.bots.some((b) => b.id === this.selected)) this.selected = this.snap.bots[0]?.id ?? null;
-      this.announce();
+      if (this.mode === "full" && !this.snap.bots.some((b) => b.id === this.selected)) this.selected = this.snap.bots[0]?.id ?? null;
+      // The sidebar copy is always shown, so it alone owns the badge and the alerts.
+      if (this.mode === "sidebar") this.announce();
       cx.notify();
     });
   }
@@ -81,7 +105,7 @@ export default class Bots extends View {
     });
   }
 
-  openBot(bot) {
+  openTerminal(bot) {
     const t = terminalOf(bot);
     if (!t) { notify({ title: `${bot} isn't running`, body: "It starts with its first message.", level: "info" }); return; }
     openOverlay({
@@ -95,74 +119,155 @@ export default class Bots extends View {
 
   render(cx) {
     const t = theme();
-    if (this.titlebar) return this.renderTitlebar(t);
-    const root = v_flex().id("bots").size_full().bg(t.chrome).text_color(t.foreground).text_size(12.5);
-    if (checking()) return root.child(div().p(12).child("Bots"));
-    const header = h_flex().h(36).px(12).items_center().justify_between().border_b_1().border_color(t.border)
-      .child(div().font_semibold().child("Bots"))
-      .child(h_flex().gap(8).items_center()
-        .child(div().text_size(11).text_color(t.dim).child(this.snap ? `v${this.snap.version}` : ""))
-        // Opened as a window (`mod.open bots`): it needs its own close button.
-        .when(Boolean(props()?.overlay), (el) => el.child(div().id("bots-close").px(6).rounded(6).cursor_pointer()
-          .text_color(t.muted).hover((s) => s.bg(t.hover))
-          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          .on_click(() => closeOverlay(props().overlay)).child("✕"))));
-    if (!this.snap) {
-      return root.child(header).child(v_flex().p(12).gap(6).text_color(t.muted)
-        .child("The herdr-bots daemon isn't running.")
-        .child(div().text_color(t.dim).child("Run `herdr-bots install-service`, then `herdr-bots new <id>`.")));
+    switch (this.mode) {
+      case "titlebar": return this.renderTitlebar(t);
+      case "sidebar": return this.renderSidebar(t);
+      case "chat": return this.renderChat(t);
+      default: return this.renderFull(t);
     }
+  }
+
+  // ---------- sidebar ----------
+
+  renderSidebar(t) {
+    const bots = this.snap?.bots ?? [];
+    const root = v_flex().id("bots-side").size_full().text_size(13).text_color(t.foreground);
+    if (narrow()) {
+      return root.pt(6).children(bots.map((b) => h_flex().id(`sb-${b.id}`).h(26).px(8).flex_none().items_center()
+        .justify_end().hover((s) => s.bg(t.hover)).on_click(() => openChat(b.id)).tooltip(b.id)
+        .child(this.dot(t, b.paused ? "paused" : b.state))));
+    }
+    const header = h_flex().px(16).h(41).pt(14).pb(5).flex_none().items_center().justify_between()
+      .child(div().text_size(11.5).font_medium().text_color(t.dim).child("Bots"))
+      .child(div().id("bots-all").text_size(11).text_color(t.dim).cursor_pointer()
+        .hover((s) => s.text_color(t.foreground)).tooltip("All bots, items and workers")
+        .on_click(() => openOverlay({ mod: "bots", kind: "window", key: "herdr-bots", width: 360, height: 640 }))
+        .child("All"));
+    let body;
+    if (!this.snap) {
+      body = div().px(16).text_size(12).text_color(t.dim).child(checking() ? "" : "herdr-bots isn't running. Run herdr-bots install-service.");
+    } else if (!bots.length) {
+      body = div().px(16).text_size(12).text_color(t.dim).child("No bots yet. Run herdr-bots new <id>.");
+    } else {
+      body = v_flex().px(8).children(bots.map((b) => this.sidebarRow(t, b)));
+    }
+    return root.child(header).child(v_flex().id("bots-side-list").flex_1().min_h(0).overflow_y_scrollbar().child(body));
+  }
+
+  sidebarRow(t, b) {
+    const question = this.snap.items.find((i) => i.bot === b.id && i.status === "needs_you");
+    const working = this.snap.items.find((i) => i.bot === b.id && i.status === "working");
+    const sub = b.paused ? "paused"
+      : question ? (question.question ?? question.title)
+      : working ? working.title
+      : b.planned ? `${b.planned} queued` : b.agent;
+    return h_flex().id(`sb-${b.id}`).h(34).px(8).gap(8).flex_none().items_center().rounded(6).cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_click(() => openChat(b.id))
+      .child(h_flex().w(14).flex_none().justify_center().child(this.dot(t, b.paused ? "paused" : b.state)))
+      .child(v_flex().flex_1().min_w(0)
+        .child(div().text_size(13).truncate().child(b.id))
+        .child(div().text_size(11).truncate().text_color(question ? t.blocked : t.dim).child(sub)))
+      .when(b.needs_you > 0, (el) => el.child(div().flex_none().px(6).rounded_full().bg(t.blocked)
+        .text_size(10.5).text_color(t.background).child(String(b.needs_you))));
+  }
+
+  // ---------- chat window ----------
+
+  renderChat(t) {
+    const bot = this.snap?.bots.find((b) => b.id === this.selected);
+    const root = v_flex().id("bots-chat").size_full().bg(t.popover).text_color(t.foreground).text_size(12.5);
+    const header = h_flex().h(40).px(12).gap(6).flex_none().items_center().border_b_1().border_color(t.border)
+      .child(bot ? this.dot(t, bot.paused ? "paused" : bot.state) : div())
+      .child(div().font_semibold().child(this.selected ?? "bot"))
+      .child(div().text_size(11).text_color(t.dim).child(bot ? `${bot.agent} · ${bot.permission}` : ""))
+      .child(div().flex_1())
+      .when(Boolean(bot), (el) => el
+        .child(this.button(t, "chat-pause", bot.paused ? "Resume" : "Pause", (cx) => this.run(cx, [bot.paused ? "resume" : "pause", bot.id])))
+        .child(this.button(t, "chat-term", "Terminal", () => this.openTerminal(bot.id))))
+      .child(this.closeButton(t));
+    if (!this.snap) return root.child(header).child(div().p(12).text_color(t.muted).child(checking() ? "" : "herdr-bots isn't running."));
+    if (!bot) return root.child(header).child(div().p(12).text_color(t.muted).child(`No bot ${this.selected}.`));
     return root.child(header)
-      .child(this.renderBots(t))
-      .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().child(this.renderItems(t)).child(this.renderWorkers(t)))
+      .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().child(this.renderItems(t, true)).child(this.renderWorkers(t)))
       .when(Boolean(this.error), (el) => el.child(div().px(12).py(6).text_size(11.5).text_color(t.blocked).child(this.error)))
       .child(this.renderInput(t));
   }
 
-  renderTitlebar(t) {
-    const { bot } = this.titlebar;
-    return h_flex().id("bots-title").size_full().px(10).items_center().justify_between().bg(t.chrome)
-      .border_b_1().border_color(t.border).text_size(12).text_color(t.foreground)
-      .child(div().font_semibold().child(`bot · ${bot}`))
-      .child(div().id("bots-title-close").px(8).rounded(6).cursor_pointer().text_color(t.muted)
-        .hover((s) => s.bg(t.hover))
-        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-        .on_click(() => closeOverlay(props().overlay)).child("✕"));
+  // ---------- full window ----------
+
+  renderFull(t) {
+    const root = v_flex().id("bots").size_full().bg(t.chrome).text_color(t.foreground).text_size(12.5);
+    const header = h_flex().h(36).px(12).flex_none().items_center().justify_between().border_b_1().border_color(t.border)
+      .child(div().font_semibold().child("Bots"))
+      .child(h_flex().gap(8).items_center()
+        .child(div().text_size(11).text_color(t.dim).child(this.snap ? `v${this.snap.version}` : ""))
+        .when(Boolean(props()?.overlay), (el) => el.child(this.closeButton(t))));
+    if (checking()) return root.child(header);
+    if (!this.snap) {
+      return root.child(header).child(v_flex().p(12).gap(6).text_color(t.muted)
+        .child("The herdr-bots daemon isn't running.")
+        .child(div().text_color(t.dim).child("Run herdr-bots install-service, then herdr-bots new <id>.")));
+    }
+    return root.child(header)
+      .child(this.renderBotList(t))
+      .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().child(this.renderItems(t, false)).child(this.renderWorkers(t)))
+      .when(Boolean(this.error), (el) => el.child(div().px(12).py(6).text_size(11.5).text_color(t.blocked).child(this.error)))
+      .child(this.renderInput(t));
   }
 
-  dot(t, state) {
-    if (state === "working") return div().w(14).text_color(t.working).frames(SPINNER, 90);
-    const color = { needs_you: t.blocked, planned: t.muted, idle: t.idle }[state] ?? t.unknown;
-    return div().w(14).text_color(color).child("●");
-  }
-
-  renderBots(t) {
+  renderBotList(t) {
     const rows = this.snap.bots.map((b) => {
       const selected = b.id === this.selected;
       const counts = [b.needs_you && `${b.needs_you} needs you`, b.working && "working", b.planned && `${b.planned} queued`]
         .filter(Boolean).join(" · ");
-      return h_flex().id(`bot-${b.id}`).px(12).py(6).gap(6).items_center().cursor_pointer()
+      return h_flex().id(`bot-${b.id}`).px(12).py(6).gap(6).flex_shrink_0().items_center().cursor_pointer()
         .bg(selected ? t.selected : t.chrome).hover((s) => s.bg(selected ? t.selected : t.hover))
         .on_click((_e, cx) => { this.selected = b.id; this.answering = null; cx.notify(); })
-        .child(this.dot(t, b.paused ? "planned" : b.state))
+        .child(this.dot(t, b.paused ? "paused" : b.state))
         .child(v_flex().flex_1().min_w(0)
           .child(h_flex().gap(6).child(div().font_medium().truncate().child(b.id))
             .child(div().text_size(11).text_color(t.dim).child(`${b.agent}${b.paused ? " · paused" : ""}`)))
           .when(Boolean(counts), (el) => el.child(div().text_size(11).text_color(t.muted).truncate().child(counts))))
         .when(selected, (el) => el
-          .child(this.button(t, `pause-${b.id}`, b.paused ? "Resume" : "Pause", (cx) => this.run(cx, [b.paused ? "resume" : "pause", b.id])))
-          .child(this.button(t, `open-${b.id}`, "Open", () => this.openBot(b.id))));
+          .child(this.button(t, `chat-${b.id}`, "Chat", () => openChat(b.id)))
+          .child(this.button(t, `term-${b.id}`, "Terminal", () => this.openTerminal(b.id))));
     });
     const broken = Object.entries(this.snap.bot_errors ?? {}).map(([id, e]) =>
       div().px(12).py(4).text_size(11).text_color(t.blocked).truncate().child(`${id}: ${e}`));
     if (!rows.length && !broken.length) {
-      return div().p(12).text_color(t.muted).child("No bots yet. Run `herdr-bots new <id>`.");
+      return div().p(12).text_color(t.muted).child("No bots yet. Run herdr-bots new <id>.");
     }
-    return v_flex().py(4).border_b_1().border_color(t.border).children([...rows, ...broken]);
+    return v_flex().py(4).flex_shrink_0().border_b_1().border_color(t.border).children([...rows, ...broken]);
   }
 
-  renderItems(t) {
-    const items = this.snap.items.filter((i) => i.bot === this.selected).slice(0, 20);
+  // ---------- shared pieces ----------
+
+  renderTitlebar(t) {
+    const { bot } = props().titlebar;
+    return h_flex().id("bots-title").size_full().px(10).items_center().justify_between().bg(t.chrome)
+      .border_b_1().border_color(t.border).text_size(12).text_color(t.foreground)
+      .child(div().font_semibold().child(`bot · ${bot}`))
+      .child(this.closeButton(t));
+  }
+
+  closeButton(t) {
+    return div().id("bots-close").px(6).rounded(6).cursor_pointer().text_color(t.muted)
+      .hover((s) => s.bg(t.hover))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click(() => closeOverlay(props().overlay)).child("✕");
+  }
+
+  dot(t, state) {
+    if (state === "working") return div().w(14).text_color(t.working).frames(SPINNER, 90);
+    const color = { needs_you: t.blocked, planned: t.muted, idle: t.idle, paused: t.dim }[state] ?? t.unknown;
+    return div().w(14).text_color(color).child(state === "paused" ? "❙❙" : "●");
+  }
+
+  // Chat: oldest first, newest just above the message box. Panel: open items first.
+  renderItems(t, chatOrder) {
+    let items = this.snap.items.filter((i) => i.bot === this.selected);
+    items = chatOrder ? [...items].sort((a, b) => a.id - b.id).slice(-20) : items.slice(0, 20);
     if (!items.length) return div().p(12).text_color(t.dim).child("Nothing yet. Say something below.");
     return v_flex().children(items.map((i) => this.renderItem(t, i)));
   }
@@ -173,7 +278,7 @@ export default class Bots extends View {
     const reply = (i.reply ?? "").trim();
     // flex_shrink_0: inside the scroll area, rows keep their height instead of squeezing.
     return v_flex().id(`item-${i.id}`).flex_shrink_0().px(12).py(8).gap(4).border_b_1().border_color(t.border)
-      .bg(answering ? t.raised : t.chrome)
+      .when(answering, (el) => el.bg(t.raised))
       .child(h_flex().gap(6).items_center()
         .child(div().text_size(11).text_color(t.dim).child(`#${i.id}`))
         .child(div().text_size(11).text_color(color).child(i.status.replace("_", " ")))
@@ -182,22 +287,22 @@ export default class Bots extends View {
         .when(!["done", "canceled"].includes(i.status), (el) => el
           .child(this.button(t, `done-${i.id}`, "Done", (cx) => this.run(cx, ["done", String(i.id)])))
           .child(this.button(t, `cancel-${i.id}`, "Cancel", (cx) => this.run(cx, ["cancel", String(i.id)])))))
-      .child(div().flex_shrink_0().font_medium().truncate().child(i.title))
+      .child(div().flex_shrink_0().font_medium().whitespace_normal().child(i.title))
       .when(Boolean(i.question), (el) => el.child(
         h_flex().id(`ask-${i.id}`).gap(6).p(6).rounded(6).bg(t.background).cursor_pointer()
           .on_click((_e, cx) => { this.answering = i.id; this.input.focus(); cx.notify(); })
           .child(div().text_color(t.blocked).child("?"))
           .child(div().flex_1().whitespace_normal().child(i.question))
           .child(div().text_size(11).text_color(t.accent).child(answering ? "answering" : "Answer"))))
-      .when(Boolean(reply), (el) => el.child(div().flex_shrink_0().max_h(160).overflow_y_scrollbar().text_size(12)
-        .child(TextView.markdown(`reply-${i.id}`, reply.length > 2000 ? `${reply.slice(0, 2000)}…` : reply))))
+      .when(Boolean(reply), (el) => el.child(div().flex_shrink_0().max_h(240).overflow_y_scrollbar().text_size(12)
+        .child(TextView.markdown(`reply-${i.id}`, reply.length > 4000 ? `${reply.slice(0, 4000)}…` : reply))))
       .when(Boolean(i.url), (el) => el.child(div().text_size(11).text_color(t.dim).truncate().child(i.url)));
   }
 
   renderWorkers(t) {
     const workers = this.snap.workers.filter((w) => w.bot === this.selected).slice(0, 8);
     if (!workers.length) return div();
-    return v_flex().px(12).py(8).gap(4)
+    return v_flex().px(12).py(8).gap(4).flex_shrink_0()
       .child(div().text_size(11).text_color(t.dim).child("WORKERS"))
       .children(workers.map((w) => h_flex().gap(6).items_center()
         .child(this.dot(t, w.status === "running" ? "working" : w.status === "done" ? "idle" : "needs_you"))
@@ -206,19 +311,20 @@ export default class Bots extends View {
   }
 
   renderInput(t) {
-    const placeholder = this.answering ? `Answer #${this.answering}` : this.selected ? `Message ${this.selected}` : "No bot selected";
-    return h_flex().p(8).gap(6).border_t_1().border_color(t.border).items_center()
+    const label = this.answering ? `Answer #${this.answering}` : this.selected ? `Message ${this.selected}` : "No bot selected";
+    return h_flex().p(8).gap(6).flex_none().border_t_1().border_color(t.border).items_end()
       .when(Boolean(this.answering), (el) => el.child(this.button(t, "unanswer", "×", (cx) => { this.answering = null; cx.notify(); })))
       .child(v_flex().flex_1().gap(2)
-        .child(div().text_size(10.5).text_color(t.dim).child(placeholder))
+        .child(div().text_size(10.5).text_color(t.dim).child(label))
         .child(Input.new(this.input).h(32).px(8).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.5)))
       .child(this.button(t, "send", "Send", (cx) => this.send(cx), true));
   }
 
   button(t, id, text, action, primary = false) {
-    return div().id(id).px(8).py(3).rounded(6).text_size(11).cursor_pointer()
+    return div().id(id).px(8).py(3).rounded(6).text_size(11).cursor_pointer().flex_none()
       .bg(primary ? t.solid : t.raised).text_color(primary ? t.solid_foreground : t.foreground)
       .hover((s) => s.opacity(0.85))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => { cx.stop_propagation(); action(cx); })
       .child(text);
   }

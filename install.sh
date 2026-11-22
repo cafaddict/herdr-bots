@@ -27,6 +27,37 @@ else
   echo "note: $app_home not found; skipping the panel (run again after installing Herdr)" >&2
 fi
 
+# Herdr's own layouts are read-only, so the sidebar entry lives in a clone of `main` called
+# `main-bots` (Bots above Agents). Made once; after that it's yours to edit.
+if [ -d "$app_home" ] && command -v herdr-app >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  layout="$app_home/layouts/main-bots.json"
+  if [ ! -f "$layout" ]; then
+    echo "==> adding Bots to the sidebar (layout main-bots)"
+    herdr-app do layout.clone '{"name":"main","as":"main-bots"}' >/dev/null
+    python3 - "$layout" <<'PY'
+import json, sys
+path = sys.argv[1]
+doc = json.load(open(path))
+def find(node, id):
+    if isinstance(node, dict):
+        if node.get("id") == id:
+            return node
+        for child in node.get("children", []):
+            hit = find(child, id)
+            if hit:
+                return hit
+lists = find(doc.get("root", doc), "sidebar-lists")
+ids = [c.get("id") for c in lists["children"]]
+if "bots" not in ids:
+    at = ids.index("agents") if "agents" in ids else len(ids)
+    lists["children"].insert(at, {"id": "bots", "type": "block", "size": {"px": 160}, "min": 60,
+                                  "content": {"mod": "bots", "props": {"sidebar": True}}})
+json.dump(doc, open(path, "w"), indent=2)
+PY
+  fi
+  herdr-app do layout.switch '{"name":"main-bots"}' >/dev/null || true
+fi
+
 echo "==> registering and starting the daemon"
 "$bin" install-service
 

@@ -27,22 +27,21 @@ git clone https://github.com/cafaddict/herdr-bots && cd herdr-bots
 ./install.sh
 ```
 
-`install.sh` does three things, and running it again just updates each one:
+`install.sh` does these things, and running it again just updates each one:
 
 1. Builds and installs the `herdr-bots` binary (`cargo install`).
 2. Copies the panel mod to `~/.config/herdr-app/mods/bots`.
 3. Registers the daemon as a service that starts at login and restarts if it dies:
    launchd (`~/Library/LaunchAgents/dev.herdr-bots.plist`) on macOS, `systemd --user` on Linux.
+4. Adds **Bots** to the left sidebar, above Agents. Herdr's own layouts are read-only, so this
+   happens in a copy of `main` called `main-bots`, and Herdr switches to it. Clicking a bot opens
+   its chat window: its items, its questions to you, its answers, and a message box. From the
+   chat window, **Terminal** opens the live Claude Code / Codex session.
+   `main-bots` is your layout now: Herdr updates to `main` don't reach it. To go back, run
+   `herdr-app do layout.switch '{"name":"main"}'`.
 
-Open the panel with the command palette (⌘⇧P / ctrl-shift-p → "mod.open", name `bots`) or from
-a shell:
-
-```bash
-herdr-app do mod.open '{"name":"bots"}'
-```
-
-The panel is a floating window that comes back after a restart. If you want a keyboard shortcut,
-add `"ctrl-shift-b": "mod.open:bots"` under `global` in `~/.config/herdr-app/keys.json`.
+"All" in the sidebar header opens everything at once: every bot, item and worker. The same view
+also opens with `herdr-app do mod.open '{"name":"bots"}'`.
 
 ## A bot
 
