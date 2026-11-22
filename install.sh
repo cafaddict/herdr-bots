@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Installs herdr-bots: the binary (cargo), the daemon service (launchd / systemd --user) and the
+# Herdr panel mod. Safe to run again: it updates each piece in place and keeps your bots.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+app_home=${HERDR_APP_HOME:-$HOME/.config/herdr-app}
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1 ($2)" >&2; exit 1; }; }
+need cargo "https://rustup.rs"
+need hc "herdr-core; install the Herdr app first"
+command -v gh >/dev/null 2>&1 || echo "note: gh not found; GitHub triggers stay off" >&2
+
+echo "==> building and installing the binary"
+cargo install --path "$here" --locked --force --quiet
+bin=$(command -v herdr-bots || echo "$HOME/.cargo/bin/herdr-bots")
+[ -x "$bin" ] || { echo "herdr-bots was not installed where expected ($bin)" >&2; exit 1; }
+
+echo "==> installing the Herdr panel mod into $app_home/mods/bots"
+if [ -d "$app_home" ]; then
+  mkdir -p "$app_home/mods/bots"
+  cp "$here/mod/bots/main.js" "$here/mod/bots/mod.json" "$app_home/mods/bots/"
+  printf '// Written by install.sh: the herdr-bots binary. Edit if you move it.\nexport const BIN = %s;\n' \
+    "\"$bin\"" > "$app_home/mods/bots/config.js"
+  if command -v herdr-app >/dev/null 2>&1; then herdr-app check "$app_home/mods/bots"; fi
+else
+  echo "note: $app_home not found; skipping the panel (run again after installing Herdr)" >&2
+fi
+
+echo "==> registering and starting the daemon"
+"$bin" install-service
+
+echo
+echo "done. next:"
+echo "  herdr-bots new <id>      # make a bot, then edit ~/.herdr-bots/bots/<id>/SOUL.md and bot.toml"
+echo "  herdr-bots status"
