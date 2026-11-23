@@ -500,9 +500,10 @@ export default class Bots extends View {
       .when(Boolean(i.question), (el) => el.child(
         h_flex().id(`ask-${i.id}`).gap(6).p(6).rounded(6).bg(t.background).cursor_pointer()
           .on_click((_e, cx) => { this.answering = i.id; this.input.focus(); cx.notify(); })
-          .child(div().text_color(t.blocked).child("?"))
-          .child(div().flex_1().whitespace_normal().child(i.question))
-          .child(div().text_size(11).text_color(t.accent).child(answering ? "answering" : "Answer"))))
+          .child(div().flex_none().text_color(t.blocked).child("?"))
+          // min_w(0): without it the text keeps its one-line width and pushes past the panel.
+          .child(div().flex_1().min_w(0).whitespace_normal().child(i.question))
+          .child(div().flex_none().text_size(11).text_color(t.accent).child(answering ? "answering" : "Answer"))))
       .when(Boolean(reply), (el) => el.child(div().flex_shrink_0().max_h(240).overflow_y_scrollbar().text_size(12)
         .child(TextView.markdown(`reply-${i.id}`, reply.length > 4000 ? `${reply.slice(0, 4000)}…` : reply))))
       .when(Boolean(i.url), (el) => el.child(div().text_size(11).text_color(t.dim).truncate().child(i.url)));
