@@ -48,6 +48,47 @@ git clone https://github.com/cafaddict/herdr-bots && cd herdr-bots
    `main-bots` is your layout now: Herdr updates to `main` don't reach it. To go back, run
    `herdr-app do layout.switch '{"name":"main"}'`.
 
+### The Herdr window on another machine
+
+The daemon and the panel can run on different machines. A common case: the Windows Herdr app
+with the daemon in WSL, where the app reaches WSL as an hc machine. Run `install.sh` in WSL and
+point it at the Windows app:
+
+```bash
+HERDR_APP_HOME=/mnt/c/Users/<you>/.config/herdr-app \
+HERDR_APP_BIN=/mnt/c/Users/<you>/AppData/Local/Programs/herdr-app/herdr-app.exe \
+HERDR_BOTS_MACHINE=wsl \
+./install.sh
+```
+
+- `HERDR_APP_HOME`: the app's folder, where the mod and the layout go.
+- `HERDR_APP_BIN`: the app's `herdr-app`. A Windows `.exe` gets Windows paths and a closed stdin.
+- `HERDR_BOTS_MACHINE`: the name the window gives the daemon's machine (`hc machine ls` on the
+  window's side). The mod then reads `status.json` and runs `herdr-bots` on that machine, and
+  reads the status file every 2 seconds instead of watching the folder, since Herdr watches
+  folders only on its own computer.
+- `HERDR_BOTS_LAYOUT`: the layout to add Bots to, default `main-bots`. Name one of your own
+  layouts to keep its other changes. It is patched in place, not copied.
+
+If the window can't see the daemon's files at all (a server you reach over ssh), install the
+mod on the window's side by hand and set `MACHINE` and `STATE_DIR` in its `config.js`.
+
+### Bots on several machines
+
+One panel can show the bots of several daemons, say one per machine, so each bot works next to
+its repos. The daemon in `config.js` is always shown; list more in `mods/bots/daemons.json` with
+`mod/add_daemon.py`. For a daemon on `dev-server` (run `./install.sh` there first; it skips the
+panel when there is no Herdr app):
+
+```bash
+python3 mod/add_daemon.py <herdr app home> dev-server \
+  /home/<you>/.cargo/bin/herdr-bots /home/<you>/.herdr-bots/state
+python3 mod/add_daemon.py <herdr app home> --remove dev-server
+```
+
+With more than one daemon, each bot shows its machine (`cos · dev-server`), New bot asks which
+machine, and every action goes to that bot's daemon.
+
 "All" in the sidebar header opens everything at once: every bot, item and worker. The same view
 also opens with `herdr-app do mod.open '{"name":"bots"}'`.
 
@@ -101,6 +142,20 @@ things:
 
 If the bot has workers running, `rm` refuses. `--force` (or the checkbox in the dialog) stops the
 workers too. Their git worktrees are kept.
+
+To rename a bot, hover it in the sidebar and click **Rename**, click its name in the chat, or run
+`herdr-bots rename <id> <new>`. Its folder, items, workers and trigger state follow. Its terminal
+ends, so the next turn starts a new session; `SOUL.md` and `MEMORY.md` stay. It refuses while the
+bot is on a turn or has running workers.
+
+To give a bot an image or a file, drop it on the chat or paste an image into the message box
+(⌘V / Ctrl+Shift+V). The panel copies it into the bot's `inbox/` on the bot's machine, and the
+message names its path. A pasted image is a temporary copy under the app's `data/bots-paste/`,
+deleted after the upload. Dropped files stay where they are. Files in `inbox/` older than 7 days
+are deleted the next time something is attached.
+
+**Copy** on a message (yours or the bot's) copies its text; **Select** shows it as text you can
+select part of.
 
 The daemon reloads a bot within 5 seconds after you save its `bot.toml`. A broken `bot.toml`
 shows up as an error in the panel and in `herdr-bots status` instead of stopping the daemon.
@@ -166,6 +221,7 @@ herdr-bots ask <bot> <text> [--item N]
 herdr-bots done|cancel <item>
 herdr-bots pause|resume <bot>
 herdr-bots rm <bot> [--force]      delete a bot (its folder goes to ~/.herdr-bots/trash)
+herdr-bots rename <bot> <new>      rename a bot (not while it is on a turn or has running workers)
 herdr-bots reload
 herdr-bots install-service | uninstall-service
 herdr-bots daemon                  (what the service runs)
