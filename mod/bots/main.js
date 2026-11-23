@@ -163,6 +163,7 @@ export default class Bots extends View {
         list.push({ daemon: this.daemonList[n], snap });
       }
       this.lastText = joined;
+      this.loaded = true;
       this.snap = list.some((x) => x.snap) ? mergeSnaps(list) : null;
       if (!this.snap) { cx.notify(); return; }
       if (this.mode === "full" && !this.snap.bots.some((b) => b.id === this.selected)) this.selected = this.snap.bots[0]?.id ?? null;
@@ -253,7 +254,7 @@ export default class Bots extends View {
           .child("+")));
     let body;
     if (!this.snap) {
-      body = div().px(16).text_size(12).text_color(t.dim).child(checking() ? "" : "herdr-bots isn't running. Run herdr-bots install-service.");
+      body = div().px(16).text_size(12).text_color(t.dim).child(checking() ? "" : !this.loaded ? "Loading…" : "herdr-bots isn't running. Run herdr-bots install-service.");
     } else if (!bots.length) {
       body = div().px(16).text_size(12).text_color(t.dim).child("No bots yet. Run herdr-bots new <id>.");
     } else {
@@ -303,8 +304,10 @@ export default class Bots extends View {
     const header = h_flex().h(40).px(12).gap(6).flex_none().items_center().border_b_1().border_color(t.border)
       .when(this.inPanel && Boolean(this.selected), (el) => el.child(this.button(t, "chat-back", "‹ Bots", () => setShared("bots.chat", null))))
       .when(Boolean(bot), (el) => el.child(this.dot(t, bot.paused ? "paused" : bot.state)))
-      .child(div().flex_none().font_semibold().child(bot ? this.label(bot) : (this.selected ?? "Bots")))
-      // The details give way first when the panel is narrow; the name never does.
+      // The name shortens before the buttons do (a machine label makes it long); the details
+      // (agent · permission) go first, then the name is cut with an ellipsis.
+      .child(div().id("chat-name").flex_shrink_1().min_w(0).truncate().font_semibold().tooltip(bot ? this.label(bot) : "")
+        .child(bot ? this.label(bot) : (this.selected ?? "Bots")))
       .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).truncate().child(bot ? `${bot.agent} · ${bot.permission}` : ""))
       .when(Boolean(bot), (el) => el
         .child(this.button(t, "chat-pause", bot.paused ? "Resume" : "Pause", (cx) => this.run(cx, bot.daemon, [bot.paused ? "resume" : "pause", bot.name])))
@@ -312,7 +315,7 @@ export default class Bots extends View {
         .child(this.button(t, "chat-delete", "Delete", () => openDeleteBot(bot))))
       .when(!this.selected, (el) => el.child(this.button(t, "chat-new", "+ New bot", () => openNewBot())))
       .child(this.closeButton(t));
-    if (!this.snap) return root.child(header).child(div().p(12).text_color(t.muted).child(checking() ? "" : "herdr-bots isn't running."));
+    if (!this.snap) return root.child(header).child(div().p(12).text_color(t.muted).child(checking() ? "" : !this.loaded ? "Loading…" : "herdr-bots isn't running."));
     if (!this.selected) {
       // Opened from the title bar's Bots button with nothing picked yet: offer the bots here.
       const bots = this.snap.bots;
@@ -342,6 +345,7 @@ export default class Bots extends View {
         .child(div().text_size(11).text_color(t.dim).child(this.snap ? `v${this.snap.version}` : ""))
         .when(Boolean(props()?.overlay), (el) => el.child(this.closeButton(t))));
     if (checking()) return root.child(header);
+    if (!this.snap && !this.loaded) return root.child(header).child(div().p(12).text_color(t.muted).child("Loading…"));
     if (!this.snap) {
       return root.child(header).child(v_flex().p(12).gap(6).text_color(t.muted)
         .child("The herdr-bots daemon isn't running.")
@@ -546,10 +550,11 @@ export default class Bots extends View {
     let items = this.snap.items.filter((i) => i.bot === this.selected);
     items = chatOrder ? [...items].sort((a, b) => a.num - b.num).slice(-20) : items.slice(0, 20);
     if (!items.length) return div().p(12).text_color(t.dim).child("Nothing yet. Say something below.");
-    return v_flex().children(items.map((i) => this.renderItem(t, i)));
+    return v_flex().children(items.map((i) => this.renderItem(t, i, chatOrder)));
   }
 
-  renderItem(t, i) {
+  // In the chat a reply shows in full: the chat area scrolls. The all-bots window caps it.
+  renderItem(t, i, fullReply = false) {
     const color = { needs_you: t.blocked, working: t.working, planned: t.muted, done: t.done, canceled: t.dim }[i.status];
     const answering = this.answering === i.key;
     const reply = (i.reply ?? "").trim();
@@ -572,8 +577,9 @@ export default class Bots extends View {
           // min_w(0): without it the text keeps its one-line width and pushes past the panel.
           .child(div().flex_1().min_w(0).whitespace_normal().child(i.question))
           .child(div().flex_none().text_size(11).text_color(t.accent).child(answering ? "answering" : "Answer"))))
-      .when(Boolean(reply), (el) => el.child(div().flex_shrink_0().max_h(240).overflow_y_scrollbar().text_size(12)
-        .child(TextView.markdown(`reply-${i.key}`, reply.length > 4000 ? `${reply.slice(0, 4000)}…` : reply))))
+      .when(Boolean(reply), (el) => el.child(div().flex_shrink_0().min_w(0).text_size(12)
+        .when(!fullReply, (d) => d.max_h(240).overflow_y_scrollbar())
+        .child(TextView.markdown(`reply-${i.key}`, !fullReply && reply.length > 4000 ? `${reply.slice(0, 4000)}…` : reply))))
       .when(Boolean(i.url), (el) => el.child(div().text_size(11).text_color(t.dim).truncate().child(i.url)));
   }
 
