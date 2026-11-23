@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -46,11 +46,31 @@ pub enum AgentStatus {
     Unknown,
 }
 
+/// hc reports an agent's status as a word (`"idle"`) in `ls`, `wait` and `send`, but `get`
+/// (hc 0.1.21) gives an object such as `{"app": "claude-code", "state": "idle"}`. Takes either.
+fn status_word_or_object<'de, D: Deserializer<'de>>(d: D) -> Result<Option<AgentStatus>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Word(AgentStatus),
+        Detailed {
+            #[serde(default)]
+            state: Option<AgentStatus>,
+        },
+    }
+    Ok(match Option::<Repr>::deserialize(d)? {
+        Some(Repr::Word(s)) => Some(s),
+        Some(Repr::Detailed { state }) => state,
+        None => None,
+    })
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Terminal {
     pub address: String,
     pub name: Option<String>,
     pub state: String,
+    #[serde(default, deserialize_with = "status_word_or_object")]
     pub status: Option<AgentStatus>,
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
@@ -70,6 +90,7 @@ pub struct WaitOutcome {
     pub ended: bool,
     /// `exit`, `timeout`, `message`, `done`, `blocked`, `idle`, `error`, `not_started`, ...
     pub reason: Option<String>,
+    #[serde(default, deserialize_with = "status_word_or_object")]
     pub status: Option<AgentStatus>,
     pub exit_code: Option<i32>,
 }
@@ -222,7 +243,7 @@ impl Hc {
             None => Ok(WaitOutcome {
                 ended: false,
                 reason: Some("not_started".into()),
-                status: Self::parse("send", v.get("status").cloned().unwrap_or(Value::Null))
+                status: status_word_or_object(v.get("status").cloned().unwrap_or(Value::Null))
                     .ok()
                     .flatten(),
                 exit_code: None,
@@ -265,5 +286,37 @@ impl Hc {
             Err(e) if !e.is_not_found() => Err(e),
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod status_shape_tests {
+    use super::*;
+
+    fn terminal(status: &str) -> Terminal {
+        serde_json::from_str(&format!(
+            r#"{{"address":"t12","name":"bot-x","state":"live","status":{status},"labels":{{}},"exit_code":null}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn get_status_as_an_object_or_a_word() {
+        assert_eq!(
+            terminal(r#"{"app":"claude-code","state":"idle"}"#).status,
+            Some(AgentStatus::Idle)
+        );
+        assert_eq!(terminal(r#""blocked""#).status, Some(AgentStatus::Blocked));
+        assert_eq!(terminal("null").status, None);
+        assert_eq!(terminal(r#"{"app":"bash"}"#).status, None);
+    }
+
+    #[test]
+    fn wait_status_still_reads_as_a_word() {
+        let w: WaitOutcome = serde_json::from_str(
+            r#"{"ended":true,"reason":"status","status":"idle","exit_code":null}"#,
+        )
+        .unwrap();
+        assert_eq!(w.status, Some(AgentStatus::Idle));
     }
 }
