@@ -21,7 +21,7 @@
 // and with more than one daemon a bot's key is "<machine>/<id>".
 
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextView, ScrollHandle } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, TextView, ScrollHandle, EditorState, Editor } from "gpui-base";
 import {
   exec, home, appHome, checking, readTextFile, watchFolder, terminals, openOverlay, closeOverlay,
   notify, setBadge, playSound, props, theme, layout, run, shared, setShared,
@@ -113,6 +113,33 @@ function openChat(bot) {
 
 const BOT_ID = /^[a-z0-9_-]{1,24}$/;
 
+// Copy, paste, cut and select-all for one text box, for keyboards that send other chords than
+// Ctrl+C/V. On Windows, mac-style setups (AutoHotkey turning ⌘ into Ctrl+Shift for the
+// terminal) send Ctrl+Shift+C/V, and ⌘A/⌘X may arrive as Alt+A/Alt+X; Ctrl+Insert and
+// Shift+Insert are the old copy/paste keys. A text box knows none of them, so the wrapper
+// around it handles them. Plain Ctrl+C/V/X/A still go to the box itself.
+function textKeys(state, readonly = false) {
+  return (e, cx) => {
+    const m = e.modifiers, key = String(e.key).toLowerCase();
+    const value = state.value(), r = state.selected_range();
+    const selected = value.slice(Math.min(r.start, r.end), Math.max(r.start, r.end));
+    if (readonly && !((m.control && (key === "c" || key === "insert")) || (m.alt && key === "a"))) return;
+    if ((m.control && m.shift && key === "v") || (m.shift && !m.control && key === "insert")) {
+      const text = cx.read_from_clipboard();
+      if (text) state.replace(text);
+    } else if ((m.control && m.shift && key === "c") || (m.control && !m.shift && key === "insert")) {
+      if (selected) cx.write_to_clipboard(selected);
+    } else if (m.alt && !m.control && key === "x") {   // not Ctrl+Shift+X: Herdr's pane.close
+      if (selected) { cx.write_to_clipboard(selected); state.replace(""); }
+    } else if (m.alt && !m.control && key === "a") {
+      state.set_selected_range({ start: 0, end: value.length });
+    } else {
+      return;
+    }
+    cx.stop_propagation();
+  };
+}
+
 function openDeleteBot(bot) {
   openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { deleteBot: bot.name, machine: bot.daemon.machine, key: bot.id } });
 }
@@ -143,6 +170,7 @@ export default class Bots extends View {
     this.firstLoad = true;
     this.input = InputState.new({ placeholder: "Message…" });
     this.chatScroll = ScrollHandle.new(); // keeps the newest turn in view
+    this.selecting = new Map();           // item key -> read-only EditorState showing the reply's source
     this.input.on("submit", (_e, cx) => this.send(cx));
     if (checking()) return;
     cx.spawn(async (cx) => {
@@ -404,7 +432,16 @@ export default class Bots extends View {
       rows.push(this.userBubble(t, `p-${i.key}`, this.pending.text, "sending…", true));
     }
     const reply = (i.reply ?? "").trim();
-    if (reply) rows.push(this.botBubble(t, `r-${i.key}`, TextView.markdown(`reply-${i.key}`, reply)));
+    const source = this.selecting.get(i.key);
+    if (reply && source) {
+      // The reply's markdown source in a read-only editor: its selection is readable, so a copy
+      // chord the rendered view ignores (⌘C sent as Ctrl+Shift+C) still copies a part.
+      const height = Math.min(reply.split("\n").length * 19 + 16, 480);
+      rows.push(this.botBubble(t, `r-${i.key}`, div().w_full().on_key_down(textKeys(source, true))
+        .child(Editor.new(source).w_full().h(height)), true));
+    } else if (reply) {
+      rows.push(this.botBubble(t, `r-${i.key}`, TextView.markdown(`reply-${i.key}`, reply).selectable(true)));
+    }
     if (i.status === "needs_you" && i.question) rows.push(this.questionBubble(t, i));
     if (i.status === "working" || i.status === "planned") {
       rows.push(this.botBubble(t, `w-${i.key}`, h_flex().gap(8).items_center()
@@ -425,9 +462,12 @@ export default class Bots extends View {
   }
 
   // The bot's: left-aligned on the raised surface, any element inside (markdown, typing dots).
-  botBubble(t, id, content) {
+  // `wide`: take the row's width, for content that sizes to its parent (an editor) and would
+  // otherwise collapse inside a bubble that sizes to its content.
+  botBubble(t, id, content, wide = false) {
     return h_flex().id(id).flex_shrink_0().w_full().pr(20)
-      .child(div().min_w(0).px(12).py(8).rounded(12).bg(t.raised).text_size(12.5).child(content));
+      .child(div().min_w(0).px(12).py(8).rounded(12).bg(t.raised).text_size(12.5)
+        .when(wide, (el) => el.flex_1()).child(content));
   }
 
   questionBubble(t, i) {
@@ -456,9 +496,21 @@ export default class Bots extends View {
     const link = (id, label, tip, args) => div().id(id).flex_none().text_color(t.dim).cursor_pointer()
       .hover((s) => s.text_color(t.foreground)).tooltip(tip)
       .on_click((_e, cx) => this.run(cx, i.daemon, args)).child(label);
+    const reply = (i.reply ?? "").trim();
     return h_flex().id(`m-${i.key}`).flex_shrink_0().gap(8).items_center().pl(4).text_size(10.5)
       .child(div().text_color(t.dim).child(`${i.botName} · #${i.num} · ${hhmm(i.updated_at)}`))
       .child(div().text_color(color).child(state))
+      // The whole reply as markdown source, for keyboards whose copy chord a text view ignores.
+      .when(Boolean(reply), (el) => el.child(div().id(`copy-${i.key}`).flex_none().text_color(t.dim).cursor_pointer()
+        .hover((s) => s.text_color(t.foreground)).tooltip("Copy the reply (markdown)")
+        .on_click((_e, cx) => { cx.write_to_clipboard(reply); this.copied = i.key; cx.notify();
+          cx.timer.after(1500, (cx) => { if (this.copied === i.key) { this.copied = null; cx.notify(); } }); })
+        .child(this.copied === i.key ? "Copied" : "Copy")))
+      .when(Boolean(reply), (el) => el.child(div().id(`select-${i.key}`).flex_none().text_color(t.dim).cursor_pointer()
+        .hover((s) => s.text_color(t.foreground))
+        .tooltip(this.selecting.has(i.key) ? "Back to the rendered reply" : "Show the source, to select a part and copy it")
+        .on_click((_e, cx) => { this.toggleSource(i.key, reply); cx.notify(); })
+        .child(this.selecting.has(i.key) ? "Rendered" : "Select")))
       .when(this.canCloseAsDone(i), (el) => el.child(link(`done-${i.key}`, "Done", "Close it as done", ["done", String(i.num)])))
       .when(!["done", "canceled"].includes(i.status), (el) => el.child(link(`cancel-${i.key}`, "Cancel",
         i.status === "working" ? "Stop waiting for it. The bot's current turn keeps going; Pause stops it."
@@ -636,7 +688,8 @@ export default class Bots extends View {
       .child(div().text_size(15).font_semibold().child(`Rename ${this.target}${this.machine ? ` on ${this.machine}` : ""}`))
       .child(div().text_size(12.5).text_color(t.muted).whitespace_normal()
         .child("Its folder, items and triggers follow. Its terminal ends, so the next turn starts a new session; SOUL.md and MEMORY.md stay. Not while it is on a turn."))
-      .child(Input.new(this.newName).h(34).px(10).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.8))
+      .child(div().on_key_down(textKeys(this.newName))
+        .child(Input.new(this.newName).h(34).px(10).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.8)))
       .when(Boolean(this.error), (el) => el.child(div().text_size(11.5).text_color(t.blocked).whitespace_normal().child(this.error)))
       .child(h_flex().pt(12).gap(8).justify_end()
         .child(this.button(t, "ren-cancel", "Cancel", () => closeOverlay(props().overlay)))
@@ -682,7 +735,8 @@ export default class Bots extends View {
 
   renderNew(t) {
     const label = (text) => div().pt(14).pb(6).text_size(11.5).text_color(t.dim).child(text);
-    const field = (state) => Input.new(state).h(34).px(10).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.8);
+    const field = (state) => div().on_key_down(textKeys(state))
+      .child(Input.new(state).h(34).px(10).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.8));
     const choice = (group, value, text) => {
       const on = this[group] === value;
       return div().id(`${group}-${value}`).px(10).py(5).rounded(7).text_size(12).cursor_pointer()
@@ -738,6 +792,12 @@ export default class Bots extends View {
           .child(div().text_size(11).text_color(t.muted).frames(SPINNER, 90))
           .child(div().text_size(11).text_color(t.muted).child("sending…")))
         .child(div().flex_shrink_0().font_medium().whitespace_normal().text_color(t.muted).child(pending.text))));
+  }
+
+  toggleSource(key, reply) {
+    const open = this.selecting.get(key);
+    if (open) { open.release(); this.selecting.delete(key); return; }
+    this.selecting.set(key, EditorState.new({ value: reply, readonly: true, soft_wrap: true, line_numbers: false, folding: false }));
   }
 
   canCloseAsDone(i) {
@@ -802,7 +862,8 @@ export default class Bots extends View {
       .when(Boolean(this.answering), (el) => el.child(this.button(t, "unanswer", "×", (cx) => { this.answering = null; cx.notify(); })))
       .child(v_flex().flex_1().gap(2)
         .child(div().text_size(10.5).text_color(t.dim).child(label))
-        .child(Input.new(this.input).h(32).px(8).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.5)))
+        .child(div().on_key_down(textKeys(this.input))
+          .child(Input.new(this.input).h(32).px(8).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.5))))
       .child(this.button(t, "send", "Send", (cx) => this.send(cx), true));
   }
 
