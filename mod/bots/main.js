@@ -14,25 +14,65 @@
 // The daemon may run on another machine than this window: a WSL distro or a server the window
 // reaches over hc (`hc machine ls`). config.js then names it in MACHINE, with the daemon's
 // state folder in STATE_DIR, and every file read and command goes there.
+//
+// More daemons, say one per machine, can be listed in daemons.json next to this file
+// (mod/add_daemon.py). Their bots then show together; each bot and item remembers its daemon,
+// and with more than one daemon a bot's key is "<machine>/<id>".
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
 import {
-  exec, home, checking, readTextFile, watchFolder, terminals, openOverlay, closeOverlay,
+  exec, home, appHome, checking, readTextFile, watchFolder, terminals, openOverlay, closeOverlay,
   notify, setBadge, playSound, props, theme, layout, run, shared, setShared,
 } from "herdr";
 // A namespace import, so a config.js written before MACHINE/STATE_DIR existed still loads.
 import * as config from "./config.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const BIN = config.BIN;
-const MACHINE = config.MACHINE ?? null;   // null: the daemon runs on this computer
-const stateDir = () => config.STATE_DIR ?? `${home()}/.herdr-bots/state`;
-const readStatus = () => readTextFile(`${stateDir()}/status.json`, { on: MACHINE }).catch(() => null);
-const bots = (args) => exec(BIN, args, { on: MACHINE }).catch((e) => ({ code: 1, stderr: String(e) }));
+// A daemon: { machine (null: this computer), bin, stateDir (null: ~/.herdr-bots/state) }.
+const MAIN_DAEMON = { machine: config.MACHINE ?? null, bin: config.BIN, stateDir: config.STATE_DIR ?? null };
+async function loadDaemons() {
+  const list = [MAIN_DAEMON];
+  const text = await readTextFile(`${appHome()}/mods/bots/daemons.json`).catch(() => null);
+  try {
+    for (const d of JSON.parse(text ?? "{}").daemons ?? []) {
+      const machine = d?.machine ?? null;
+      if (!d?.bin || list.some((x) => x.machine === machine)) continue;
+      list.push({ machine, bin: d.bin, stateDir: d.state_dir ?? null });
+    }
+  } catch { /* a broken daemons.json leaves the main daemon alone */ }
+  return list;
+}
+// Saving daemons.json reloads the mod, so one load per module is enough.
+let daemonsLoaded = null;
+const daemons = () => (daemonsLoaded ??= loadDaemons());
+const stateDirOf = (d) => d.stateDir ?? `${home()}/.herdr-bots/state`;
+const readStatusOf = (d) => readTextFile(`${stateDirOf(d)}/status.json`, { on: d.machine }).catch(() => null);
+const runOn = (d, args) => exec(d.bin, args, { on: d.machine }).catch((e) => ({ code: 1, stderr: String(e) }));
+const machineLabel = (d) => d.machine ?? "this computer";
 // Another machine's terminals have addresses like "wsl/t3"; this computer's are bare ("t3").
-const onDaemonMachine = (t) => (MACHINE ? String(t.address).startsWith(`${MACHINE}/`) : !String(t.address).includes("/"));
-const terminalOf = (bot) => terminals().find((t) => t.name === `bot-${bot}` && t.state === "live" && onDaemonMachine(t));
+const onMachine = (d, t) => (d.machine ? String(t.address).startsWith(`${d.machine}/`) : !String(t.address).includes("/"));
+const terminalOf = (bot) => terminals().find((t) => t.name === `bot-${bot.name}` && t.state === "live" && onMachine(bot.daemon, t));
+// One daemon: keys are the plain bot ids, as before. More: "<machine>/<id>".
+const botKey = (d, id, multi) => (multi ? `${d.machine ?? "local"}/${id}` : id);
+
+// Every daemon's status.json as one snapshot. Bots, items and workers carry their daemon,
+// the daemon's own id (name, num) and a key that is unique across daemons.
+function mergeSnaps(list) {
+  const multi = list.length > 1;
+  const out = { bots: [], items: [], workers: [], bot_errors: {}, version: null, daemons: [] };
+  for (const { daemon: d, snap } of list) {
+    out.daemons.push({ daemon: d, up: Boolean(snap) });
+    if (!snap) continue;
+    out.version ??= snap.version;
+    const key = (id) => botKey(d, id, multi);
+    for (const b of snap.bots ?? []) out.bots.push({ ...b, id: key(b.id), name: b.id, daemon: d });
+    for (const i of snap.items ?? []) out.items.push({ ...i, bot: key(i.bot), botName: i.bot, num: i.id, key: `${d.machine ?? "local"}#${i.id}`, daemon: d });
+    for (const w of snap.workers ?? []) out.workers.push({ ...w, bot: key(w.bot) });
+    for (const [id, e] of Object.entries(snap.bot_errors ?? {})) out.bot_errors[key(id)] = e;
+  }
+  return out;
+}
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -64,7 +104,7 @@ function openChat(bot) {
 const BOT_ID = /^[a-z0-9_-]{1,24}$/;
 
 function openDeleteBot(bot) {
-  openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { deleteBot: bot } });
+  openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { deleteBot: bot.name, machine: bot.daemon.machine, key: bot.id } });
 }
 
 function openNewBot() {
@@ -88,31 +128,43 @@ export default class Bots extends View {
     this.input = InputState.new({ placeholder: "Message…" });
     this.input.on("submit", (_e, cx) => this.send(cx));
     if (checking()) return;
-    this.reload(cx);
-    if (MACHINE) {
-      // watchFolder sees only this computer: read the other machine's status file instead.
-      // reload() redraws only when the text changed.
-      cx.timer.every(2000, (cx) => this.reload(cx));
-    } else {
-      cx.spawn(async (cx) => {
+    cx.spawn(async (cx) => {
+      this.daemonList = await daemons();
+      this.reload(cx);
+      const local = this.daemonList.find((d) => !d.machine);
+      if (this.daemonList.some((d) => d.machine)) {
+        // watchFolder sees only this computer: read other machines' status files instead.
+        // reload() redraws only when something changed.
+        cx.timer.every(2000, (cx) => this.reload(cx));
+      } else {
+        // The folder may not exist until the daemon first starts; poll gently as a fallback.
+        cx.timer.every(15000, (cx) => this.reload(cx));
+      }
+      if (local) {
         for (;;) {
-          try { await watchFolder(stateDir()); } catch { await new Promise((r) => cx.timer.after(5000, r)); }
+          try { await watchFolder(stateDirOf(local)); } catch { await new Promise((r) => cx.timer.after(5000, r)); }
           this.reload(cx);
         }
-      });
-      // The folder may not exist until the daemon first starts; poll gently as a fallback.
-      cx.timer.every(15000, (cx) => this.reload(cx));
-    }
+      }
+    });
     if (this.mode === "chat") cx.timer.after(300, () => this.input.focus());
   }
 
   reload(cx) {
+    if (!this.daemonList) return;
     cx.spawn(async (cx) => {
-      const text = await readStatus();
-      if (text === this.lastText && this.snap) return;
-      this.lastText = text;
-      if (!text) { this.snap = null; cx.notify(); return; }
-      try { this.snap = JSON.parse(text); } catch { return; } // mid-write; the next change rereads
+      const texts = await Promise.all(this.daemonList.map(readStatusOf));
+      const joined = JSON.stringify(texts);
+      if (joined === this.lastText && this.snap) return;
+      const list = [];
+      for (const [n, text] of texts.entries()) {
+        let snap = null;
+        try { snap = text ? JSON.parse(text) : null; } catch { return; } // mid-write; the next change rereads
+        list.push({ daemon: this.daemonList[n], snap });
+      }
+      this.lastText = joined;
+      this.snap = list.some((x) => x.snap) ? mergeSnaps(list) : null;
+      if (!this.snap) { cx.notify(); return; }
       if (this.mode === "full" && !this.snap.bots.some((b) => b.id === this.selected)) this.selected = this.snap.bots[0]?.id ?? null;
       // The sidebar copy is always shown, so it alone owns the badge and the alerts.
       if (this.mode === "sidebar") this.announce();
@@ -125,28 +177,30 @@ export default class Bots extends View {
     const asking = this.snap.items.filter((i) => i.status === "needs_you");
     setBadge(asking.length ? String(asking.length) : null);
     for (const item of asking) {
-      if (this.seenQuestions.has(item.id)) continue;
-      this.seenQuestions.add(item.id);
+      if (this.seenQuestions.has(item.key)) continue;
+      this.seenQuestions.add(item.key);
       if (this.firstLoad) continue;
       playSound("blocked");
-      notify({ title: `${item.bot} needs you`, body: item.question ?? item.title, level: "warning" });
+      notify({ title: `${item.botName} needs you`, body: item.question ?? item.title, level: "warning" });
     }
     this.firstLoad = false;
   }
 
   send(cx) {
     const text = this.input.value().trim();
-    if (!text || !this.selected) return;
-    const args = ["ask", this.selected, text];
-    if (this.answering) args.push("--item", String(this.answering));
+    const bot = this.snap?.bots.find((b) => b.id === this.selected);
+    if (!text || !bot) return;
+    const args = ["ask", bot.name, text];
+    const answering = this.snap.items.find((i) => i.key === this.answering);
+    if (answering) args.push("--item", String(answering.num));
     this.input.set_value("");
     this.answering = null;
-    this.run(cx, args);
+    this.run(cx, bot.daemon, args);
   }
 
-  run(cx, args) {
+  run(cx, daemon, args) {
     cx.spawn(async (cx) => {
-      const r = await bots(args);
+      const r = await runOn(daemon, args);
       this.error = r.code === 0 ? null : (r.stderr || r.stdout || "failed").trim();
       cx.notify();
     });
@@ -154,11 +208,11 @@ export default class Bots extends View {
 
   openTerminal(bot) {
     const t = terminalOf(bot);
-    if (!t) { notify({ title: `${bot} isn't running`, body: "It starts with its first message.", level: "info" }); return; }
+    if (!t) { notify({ title: `${bot.name} isn't running`, body: "It starts with its first message.", level: "info" }); return; }
     openOverlay({
-      kind: "window", key: `bot-${bot}`, width: 760, height: 520,
+      kind: "window", key: `bot-${bot.id}`, width: 760, height: 520,
       layout: { type: "column", children: [
-        { type: "block", size: { px: 30 }, content: { mod: "bots", props: { titlebar: { bot } } } },
+        { type: "block", size: { px: 30 }, content: { mod: "bots", props: { titlebar: { bot: bot.id } } } },
         { type: "block", content: { terminal: t.address } },
       ] },
     });
@@ -183,7 +237,7 @@ export default class Bots extends View {
     const root = v_flex().id("bots-side").size_full().text_size(13).text_color(t.foreground);
     if (narrow()) {
       return root.pt(6).children(bots.map((b) => h_flex().id(`sb-${b.id}`).h(26).px(8).flex_none().items_center()
-        .justify_end().hover((s) => s.bg(t.hover)).on_click(() => openChat(b.id)).tooltip(b.id)
+        .justify_end().hover((s) => s.bg(t.hover)).on_click(() => openChat(b.id)).tooltip(this.label(b))
         .child(this.dot(t, b.paused ? "paused" : b.state))));
     }
     const header = h_flex().px(16).h(41).pt(14).pb(5).flex_none().items_center().justify_between()
@@ -224,7 +278,7 @@ export default class Bots extends View {
       .on_click(() => openChat(b.id))
       .child(h_flex().w(14).flex_none().justify_center().child(this.dot(t, b.paused ? "paused" : b.state)))
       .child(v_flex().flex_1().min_w(0)
-        .child(div().text_size(13).truncate().child(b.id))
+        .child(div().text_size(13).truncate().child(this.label(b)))
         .child(div().text_size(11).truncate().text_color(question ? t.blocked : t.dim).child(sub)))
       .when(b.needs_you > 0 && !hovered, (el) => el.child(div().flex_none().px(6).rounded_full().bg(t.blocked)
         .text_size(10.5).text_color(t.background).child(String(b.needs_you))))
@@ -232,7 +286,7 @@ export default class Bots extends View {
       .when(hovered, (el) => el.child(div().id(`sb-del-${b.id}`).flex_none().px(6).py(2).rounded(5).text_size(11)
         .text_color(t.dim).hover((s) => s.bg(t.raised).text_color(t.blocked))
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-        .on_click((_e, cx) => { cx.stop_propagation(); openDeleteBot(b.id); })
+        .on_click((_e, cx) => { cx.stop_propagation(); openDeleteBot(b); })
         .child("Delete")));
   }
 
@@ -249,13 +303,13 @@ export default class Bots extends View {
     const header = h_flex().h(40).px(12).gap(6).flex_none().items_center().border_b_1().border_color(t.border)
       .when(this.inPanel && Boolean(this.selected), (el) => el.child(this.button(t, "chat-back", "‹ Bots", () => setShared("bots.chat", null))))
       .when(Boolean(bot), (el) => el.child(this.dot(t, bot.paused ? "paused" : bot.state)))
-      .child(div().flex_none().font_semibold().child(this.selected ?? "Bots"))
+      .child(div().flex_none().font_semibold().child(bot ? this.label(bot) : (this.selected ?? "Bots")))
       // The details give way first when the panel is narrow; the name never does.
       .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).truncate().child(bot ? `${bot.agent} · ${bot.permission}` : ""))
       .when(Boolean(bot), (el) => el
-        .child(this.button(t, "chat-pause", bot.paused ? "Resume" : "Pause", (cx) => this.run(cx, [bot.paused ? "resume" : "pause", bot.id])))
-        .child(this.button(t, "chat-term", "Terminal", () => this.openTerminal(bot.id)))
-        .child(this.button(t, "chat-delete", "Delete", () => openDeleteBot(bot.id))))
+        .child(this.button(t, "chat-pause", bot.paused ? "Resume" : "Pause", (cx) => this.run(cx, bot.daemon, [bot.paused ? "resume" : "pause", bot.name])))
+        .child(this.button(t, "chat-term", "Terminal", () => this.openTerminal(bot)))
+        .child(this.button(t, "chat-delete", "Delete", () => openDeleteBot(bot))))
       .when(!this.selected, (el) => el.child(this.button(t, "chat-new", "+ New bot", () => openNewBot())))
       .child(this.closeButton(t));
     if (!this.snap) return root.child(header).child(div().p(12).text_color(t.muted).child(checking() ? "" : "herdr-bots isn't running."));
@@ -310,12 +364,12 @@ export default class Bots extends View {
         .on_click((_e, cx) => { this.selected = b.id; this.answering = null; cx.notify(); })
         .child(this.dot(t, b.paused ? "paused" : b.state))
         .child(v_flex().flex_1().min_w(0)
-          .child(h_flex().gap(6).child(div().font_medium().truncate().child(b.id))
+          .child(h_flex().gap(6).child(div().font_medium().truncate().child(this.label(b)))
             .child(div().text_size(11).text_color(t.dim).child(`${b.agent}${b.paused ? " · paused" : ""}`)))
           .when(Boolean(counts), (el) => el.child(div().text_size(11).text_color(t.muted).truncate().child(counts))))
         .when(selected, (el) => el
           .child(this.button(t, `chat-${b.id}`, "Chat", () => openChat(b.id)))
-          .child(this.button(t, `term-${b.id}`, "Terminal", () => this.openTerminal(b.id))));
+          .child(this.button(t, `term-${b.id}`, "Terminal", () => this.openTerminal(b))));
     });
     const broken = Object.entries(this.snap.bot_errors ?? {}).map(([id, e]) =>
       div().px(12).py(4).text_size(11).text_color(t.blocked).truncate().child(`${id}: ${e}`));
@@ -345,7 +399,9 @@ export default class Bots extends View {
   // ---------- delete bot dialog ----------
 
   initDelete(cx) {
-    this.target = props().deleteBot;
+    this.target = props().deleteBot;   // the daemon's own id for the bot
+    this.targetKey = props().key ?? this.target;
+    this.machine = props().machine ?? null;
     this.force = false;
     this.busy = false;
     this.error = null;
@@ -354,7 +410,8 @@ export default class Bots extends View {
     if (checking()) return;
     cx.timer.after(100, () => this.handle.focus());
     cx.spawn(async (cx) => {
-      const text = await readStatus();
+      this.daemon = (await daemons()).find((d) => d.machine === this.machine) ?? MAIN_DAEMON;
+      const text = await readStatusOf(this.daemon);
       try {
         const snap = JSON.parse(text ?? "{}");
         this.workers = (snap.workers ?? []).filter((w) => w.bot === this.target && w.status === "running").length;
@@ -370,10 +427,10 @@ export default class Bots extends View {
     const args = ["rm", this.target];
     if (this.force) args.push("--force");
     cx.spawn(async (cx) => {
-      const r = await bots(args);
+      const r = await runOn(this.daemon ?? MAIN_DAEMON, args);
       this.busy = false;
       if (r.code !== 0) { this.error = (r.stderr || r.stdout || "failed").trim(); cx.notify(); return; }
-      if (shared("bots.chat") === this.target) setShared("bots.chat", null);
+      if (shared("bots.chat") === this.targetKey) setShared("bots.chat", null);
       closeOverlay(props().overlay);
       notify({ title: `Deleted ${this.target}`, body: "Its folder is in ~/.herdr-bots/trash.", level: "info" });
     });
@@ -387,7 +444,7 @@ export default class Bots extends View {
         else if (e.key === "enter") { this.remove(cx); cx.stop_propagation(); }
       })
       .w_full().p(18).gap(8).bg(t.popover).text_color(t.foreground)
-      .child(div().text_size(15).font_semibold().child(`Delete ${this.target}?`))
+      .child(div().text_size(15).font_semibold().child(`Delete ${this.target}${this.machine ? ` on ${this.machine}` : ""}?`))
       .child(line("Its open items are canceled and its agent's terminal ends."))
       .child(line("Its folder (SOUL.md, MEMORY.md, bot.toml) moves to ~/.herdr-bots/trash, so you can bring it back."))
       .when(this.workers > 0, (el) => el.child(h_flex().id("del-force").gap(8).pt(4).items_center().cursor_pointer()
@@ -410,8 +467,11 @@ export default class Bots extends View {
     this.newRole = InputState.new({ placeholder: "Reviews my PRs and summarizes what to fix" });
     this.newAgent = "claude";
     this.newPermission = "full-access";
+    this.newDaemon = 0;          // index into this.daemonList
+    this.daemonList = [MAIN_DAEMON];
     this.error = null;
     this.busy = false;
+    if (!checking()) cx.spawn(async (cx) => { this.daemonList = await daemons(); cx.notify(); });
     this.newId.on("submit", (_e, cx) => this.create(cx));
     this.newRole.on("submit", (_e, cx) => this.create(cx));
     this.newId.on("change", (_e, cx) => cx.notify());
@@ -427,12 +487,13 @@ export default class Bots extends View {
     const args = ["new", id, "--agent", this.newAgent, "--permission", this.newPermission];
     const role = this.newRole.value().trim();
     if (role) args.push("--role", role);
+    const daemon = this.daemonList[this.newDaemon] ?? MAIN_DAEMON;
     cx.spawn(async (cx) => {
-      const r = await bots(args);
+      const r = await runOn(daemon, args);
       this.busy = false;
       if (r.code !== 0) { this.error = (r.stderr || r.stdout || "failed").trim(); cx.notify(); return; }
       closeOverlay(props().overlay);
-      openChat(id);
+      openChat(botKey(daemon, id, this.daemonList.length > 1));
     });
   }
 
@@ -454,6 +515,8 @@ export default class Bots extends View {
       .child(div().text_size(15).font_semibold().child("New bot"))
       .child(label("Name (a-z 0-9 - _)")).child(field(this.newId))
       .child(label("What it's for (goes into SOUL.md; edit it later)")).child(field(this.newRole))
+      .when(this.daemonList.length > 1, (el) => el.child(label("Machine")).child(h_flex().gap(6)
+        .children(this.daemonList.map((d, n) => choice("newDaemon", n, machineLabel(d))))))
       .child(label("Agent")).child(h_flex().gap(6).child(choice("newAgent", "claude", "Claude Code")).child(choice("newAgent", "codex", "Codex")))
       .child(label("Permission")).child(h_flex().gap(6)
         .child(choice("newPermission", "full-access", "Full access"))
@@ -467,6 +530,11 @@ export default class Bots extends View {
         .child(this.button(t, "new-create", this.busy ? "Creating…" : "Create", (cx) => this.create(cx), valid)));
   }
 
+  // A bot's name, with its machine when bots from several daemons share the list.
+  label(b) {
+    return this.daemonList?.length > 1 ? `${b.name} · ${machineLabel(b.daemon)}` : b.name;
+  }
+
   dot(t, state) {
     if (state === "working") return div().w(14).text_color(t.working).frames(SPINNER, 90);
     const color = { needs_you: t.blocked, planned: t.muted, idle: t.idle, paused: t.dim }[state] ?? t.unknown;
@@ -476,36 +544,36 @@ export default class Bots extends View {
   // Chat: oldest first, newest just above the message box. Panel: open items first.
   renderItems(t, chatOrder) {
     let items = this.snap.items.filter((i) => i.bot === this.selected);
-    items = chatOrder ? [...items].sort((a, b) => a.id - b.id).slice(-20) : items.slice(0, 20);
+    items = chatOrder ? [...items].sort((a, b) => a.num - b.num).slice(-20) : items.slice(0, 20);
     if (!items.length) return div().p(12).text_color(t.dim).child("Nothing yet. Say something below.");
     return v_flex().children(items.map((i) => this.renderItem(t, i)));
   }
 
   renderItem(t, i) {
     const color = { needs_you: t.blocked, working: t.working, planned: t.muted, done: t.done, canceled: t.dim }[i.status];
-    const answering = this.answering === i.id;
+    const answering = this.answering === i.key;
     const reply = (i.reply ?? "").trim();
     // flex_shrink_0: inside the scroll area, rows keep their height instead of squeezing.
-    return v_flex().id(`item-${i.id}`).flex_shrink_0().px(12).py(8).gap(4).border_b_1().border_color(t.border)
+    return v_flex().id(`item-${i.key}`).flex_shrink_0().px(12).py(8).gap(4).border_b_1().border_color(t.border)
       .when(answering, (el) => el.bg(t.raised))
       .child(h_flex().gap(6).items_center()
-        .child(div().text_size(11).text_color(t.dim).child(`#${i.id}`))
+        .child(div().text_size(11).text_color(t.dim).child(`#${i.num}`))
         .child(div().text_size(11).text_color(color).child(i.status.replace("_", " ")))
         .child(div().text_size(11).text_color(t.dim).child(i.source))
         .child(div().flex_1())
         .when(!["done", "canceled"].includes(i.status), (el) => el
-          .child(this.button(t, `done-${i.id}`, "Done", (cx) => this.run(cx, ["done", String(i.id)])))
-          .child(this.button(t, `cancel-${i.id}`, "Cancel", (cx) => this.run(cx, ["cancel", String(i.id)])))))
+          .child(this.button(t, `done-${i.key}`, "Done", (cx) => this.run(cx, i.daemon, ["done", String(i.num)])))
+          .child(this.button(t, `cancel-${i.key}`, "Cancel", (cx) => this.run(cx, i.daemon, ["cancel", String(i.num)])))))
       .child(div().flex_shrink_0().font_medium().whitespace_normal().child(i.title))
       .when(Boolean(i.question), (el) => el.child(
-        h_flex().id(`ask-${i.id}`).gap(6).p(6).rounded(6).bg(t.background).cursor_pointer()
-          .on_click((_e, cx) => { this.answering = i.id; this.input.focus(); cx.notify(); })
+        h_flex().id(`ask-${i.key}`).gap(6).p(6).rounded(6).bg(t.background).cursor_pointer()
+          .on_click((_e, cx) => { this.answering = i.key; this.input.focus(); cx.notify(); })
           .child(div().flex_none().text_color(t.blocked).child("?"))
           // min_w(0): without it the text keeps its one-line width and pushes past the panel.
           .child(div().flex_1().min_w(0).whitespace_normal().child(i.question))
           .child(div().flex_none().text_size(11).text_color(t.accent).child(answering ? "answering" : "Answer"))))
       .when(Boolean(reply), (el) => el.child(div().flex_shrink_0().max_h(240).overflow_y_scrollbar().text_size(12)
-        .child(TextView.markdown(`reply-${i.id}`, reply.length > 4000 ? `${reply.slice(0, 4000)}…` : reply))))
+        .child(TextView.markdown(`reply-${i.key}`, reply.length > 4000 ? `${reply.slice(0, 4000)}…` : reply))))
       .when(Boolean(i.url), (el) => el.child(div().text_size(11).text_color(t.dim).truncate().child(i.url)));
   }
 
@@ -521,7 +589,9 @@ export default class Bots extends View {
   }
 
   renderInput(t) {
-    const label = this.answering ? `Answer #${this.answering}` : this.selected ? `Message ${this.selected}` : "No bot selected";
+    const answering = this.snap?.items.find((i) => i.key === this.answering);
+    const bot = this.snap?.bots.find((b) => b.id === this.selected);
+    const label = answering ? `Answer #${answering.num}` : bot ? `Message ${this.label(bot)}` : "No bot selected";
     return h_flex().p(8).gap(6).flex_none().border_t_1().border_color(t.border).items_end()
       .when(Boolean(this.answering), (el) => el.child(this.button(t, "unanswer", "×", (cx) => { this.answering = null; cx.notify(); })))
       .child(v_flex().flex_1().gap(2)

@@ -73,6 +73,22 @@ HERDR_BOTS_MACHINE=wsl \
 If the window can't see the daemon's files at all (a server you reach over ssh), install the
 mod on the window's side by hand and set `MACHINE` and `STATE_DIR` in its `config.js`.
 
+### Bots on several machines
+
+One panel can show the bots of several daemons, say one per machine, so each bot works next to
+its repos. The daemon in `config.js` is always shown; list more in `mods/bots/daemons.json` with
+`mod/add_daemon.py`. For a daemon on `dev-server` (run `./install.sh` there first; it skips the
+panel when there is no Herdr app):
+
+```bash
+python3 mod/add_daemon.py <herdr app home> dev-server \
+  /home/<you>/.cargo/bin/herdr-bots /home/<you>/.herdr-bots/state
+python3 mod/add_daemon.py <herdr app home> --remove dev-server
+```
+
+With more than one daemon, each bot shows its machine (`cos · dev-server`), New bot asks which
+machine, and every action goes to that bot's daemon.
+
 "All" in the sidebar header opens everything at once: every bot, item and worker. The same view
 also opens with `herdr-app do mod.open '{"name":"bots"}'`.
 
