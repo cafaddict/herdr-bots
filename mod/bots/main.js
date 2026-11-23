@@ -20,7 +20,7 @@
 // and with more than one daemon a bot's key is "<machine>/<id>".
 
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, TextView, ScrollHandle } from "gpui-base";
 import {
   exec, home, appHome, checking, readTextFile, watchFolder, terminals, openOverlay, closeOverlay,
   notify, setBadge, playSound, props, theme, layout, run, shared, setShared,
@@ -29,6 +29,15 @@ import {
 import * as config from "./config.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TYPING = ["●  ·  ·", "·  ●  ·", "·  ·  ●"];
+const hhmm = (ms) => {
+  if (!ms) return "";
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+// The daemon appends each answer to an item's body as "\n\n[answer] <text>".
+const ANSWER_SEP = "\n\n[answer] ";
+const SOURCE_LABEL = { schedule: "⏰ Schedule", github: "GitHub", linear: "Linear" };
 // A daemon: { machine (null: this computer), bin, stateDir (null: ~/.herdr-bots/state) }.
 const MAIN_DAEMON = { machine: config.MACHINE ?? null, bin: config.BIN, stateDir: config.STATE_DIR ?? null };
 async function loadDaemons() {
@@ -126,6 +135,7 @@ export default class Bots extends View {
     this.seenQuestions = new Set();
     this.firstLoad = true;
     this.input = InputState.new({ placeholder: "Message…" });
+    this.chatScroll = ScrollHandle.new(); // keeps the newest turn in view
     this.input.on("submit", (_e, cx) => this.send(cx));
     if (checking()) return;
     cx.spawn(async (cx) => {
@@ -340,9 +350,105 @@ export default class Bots extends View {
     }
     if (!bot) return root.child(header).child(div().p(12).text_color(t.muted).child(`No bot ${this.selected}.`));
     return root.child(header)
-      .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar().child(this.renderItems(t, true)).child(this.renderWorkers(t)))
+      .child(this.renderConversation(t))
       .when(Boolean(this.error), (el) => el.child(div().px(12).py(6).text_size(11.5).text_color(t.blocked).child(this.error)))
       .child(this.renderInput(t));
+  }
+
+  // ---------- chat: one turn per item, as message bubbles ----------
+  //
+  // An item reads as a short conversation: what started it (my message on the right, or a
+  // line for a schedule / GitHub / Linear item), my answers, then the bot on the left: its
+  // reply, its open question, or a typing bubble while it works. status.json holds an item's
+  // body (with my answers appended), its latest question and its latest reply, so earlier
+  // questions of a long exchange are not shown.
+
+  renderConversation(t) {
+    const items = this.snap.items.filter((i) => i.bot === this.selected).sort((a, b) => a.num - b.num).slice(-30);
+    const pending = this.pending?.bot === this.selected ? this.pending : null;
+    const turns = items.map((i) => this.renderTurn(t, i));
+    if (pending && !pending.answering) turns.push(this.userBubble(t, "pending", pending.text, "sending…", true));
+    if (!turns.length) {
+      return v_flex().flex_1().min_h(0).items_center().justify_center().text_size(12).text_color(t.dim).child("Nothing yet. Say something below.");
+    }
+    // Bring the newest turn into view when one arrives or changes.
+    const last = items.at(-1);
+    const sig = `${this.selected}|${items.length}|${last?.status}|${last?.updated_at}|${pending ? 1 : 0}`;
+    if (sig !== this.scrollSig) { this.scrollSig = sig; this.chatScroll.scroll_to_item(turns.length - 1); }
+    return v_flex().id("bots-conversation").flex_1().min_h(0).overflow_y_scrollbar().track_scroll(this.chatScroll)
+      .px(12).pt(12).pb(4).gap(16).children(turns).child(this.renderWorkers(t));
+  }
+
+  renderTurn(t, i) {
+    const [first, ...answers] = (i.body || i.title || "").split(ANSWER_SEP);
+    const rows = [];
+    if (i.source === "chat") rows.push(this.userBubble(t, `u-${i.key}`, first, hhmm(i.created_at)));
+    else rows.push(this.originLine(t, i, first));
+    answers.forEach((a, n) => rows.push(this.userBubble(t, `a-${i.key}-${n}`, a, "answer")));
+    if (this.pending?.answering === i.num && this.pending.bot === i.bot) {
+      rows.push(this.userBubble(t, `p-${i.key}`, this.pending.text, "sending…", true));
+    }
+    const reply = (i.reply ?? "").trim();
+    if (reply) rows.push(this.botBubble(t, `r-${i.key}`, TextView.markdown(`reply-${i.key}`, reply)));
+    if (i.status === "needs_you" && i.question) rows.push(this.questionBubble(t, i));
+    if (i.status === "working" || i.status === "planned") {
+      rows.push(this.botBubble(t, `w-${i.key}`, h_flex().gap(8).items_center()
+        .child(div().text_color(t.muted).frames(TYPING, 320))
+        .child(div().text_size(11.5).text_color(t.dim).child(i.status === "planned" ? "queued" : "working"))));
+    }
+    rows.push(this.turnMeta(t, i));
+    return v_flex().id(`turn-${i.key}`).flex_shrink_0().gap(6).children(rows);
+  }
+
+  // Mine: right-aligned, tinted. `note` goes under it (time, "answer", "sending…").
+  userBubble(t, id, text, note, faded = false) {
+    return v_flex().id(id).flex_shrink_0().w_full().items_end().gap(2)
+      .child(h_flex().w_full().justify_end().pl(40)
+        .child(div().min_w(0).px(11).py(7).rounded(12).bg(t.accent + "30").text_size(12.5)
+          .text_color(faded ? t.muted : t.foreground).whitespace_normal().child(text)))
+      .when(Boolean(note), (el) => el.child(div().pr(4).text_size(10.5).text_color(t.dim).child(note)));
+  }
+
+  // The bot's: left-aligned on the raised surface, any element inside (markdown, typing dots).
+  botBubble(t, id, content) {
+    return h_flex().id(id).flex_shrink_0().w_full().pr(20)
+      .child(div().min_w(0).px(12).py(8).rounded(12).bg(t.raised).text_size(12.5).child(content));
+  }
+
+  questionBubble(t, i) {
+    const answering = this.answering === i.key;
+    return h_flex().id(`q-${i.key}`).flex_shrink_0().w_full().pr(20)
+      .child(v_flex().min_w(0).gap(6).px(12).py(8).rounded(12).bg(t.raised).border_1().border_color(t.blocked)
+        .child(div().text_size(10.5).text_color(t.blocked).child("needs you"))
+        .child(div().text_size(12.5).whitespace_normal().child(i.question))
+        .child(h_flex().child(this.button(t, `reply-to-${i.key}`, answering ? "Replying…" : "Reply", (cx) => {
+          this.answering = i.key; this.input.focus(); cx.notify();
+        }, answering))));
+  }
+
+  // A schedule, GitHub or Linear item: one quiet line instead of a bubble of mine.
+  originLine(t, i, text) {
+    return h_flex().id(`o-${i.key}`).flex_shrink_0().w_full().gap(6).items_center().text_size(11)
+      .child(div().flex_none().text_color(t.muted).child(SOURCE_LABEL[i.source] ?? i.source))
+      .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).tooltip(i.url ?? text).child(i.title || text))
+      .child(div().flex_none().text_color(t.dim).child(hhmm(i.created_at)));
+  }
+
+  // Under the bot's side: who, when, the state, and what can be done with the item.
+  turnMeta(t, i) {
+    const state = { done: "done", canceled: "canceled", needs_you: "needs you", working: "working", planned: "queued" }[i.status] ?? i.status;
+    const color = { needs_you: t.blocked, working: t.working, done: t.dim, canceled: t.dim, planned: t.muted }[i.status] ?? t.dim;
+    const link = (id, label, tip, args) => div().id(id).flex_none().text_color(t.dim).cursor_pointer()
+      .hover((s) => s.text_color(t.foreground)).tooltip(tip)
+      .on_click((_e, cx) => this.run(cx, i.daemon, args)).child(label);
+    return h_flex().id(`m-${i.key}`).flex_shrink_0().gap(8).items_center().pl(4).text_size(10.5)
+      .child(div().text_color(t.dim).child(`${i.botName} · #${i.num} · ${hhmm(i.updated_at)}`))
+      .child(div().text_color(color).child(state))
+      .when(this.canCloseAsDone(i), (el) => el.child(link(`done-${i.key}`, "Done", "Close it as done", ["done", String(i.num)])))
+      .when(!["done", "canceled"].includes(i.status), (el) => el.child(link(`cancel-${i.key}`, "Cancel",
+        i.status === "working" ? "Stop waiting for it. The bot's current turn keeps going; Pause stops it."
+          : i.status === "planned" ? "Drop it before it runs" : "Close it without an answer",
+        ["cancel", String(i.num)])));
   }
 
   // ---------- full window ----------
@@ -628,7 +734,7 @@ export default class Bots extends View {
   renderInput(t) {
     const answering = this.snap?.items.find((i) => i.key === this.answering);
     const bot = this.snap?.bots.find((b) => b.id === this.selected);
-    const label = answering ? `Answer #${answering.num}` : bot ? `Message ${this.label(bot)}` : "No bot selected";
+    const label = answering ? `Reply to ${answering.botName}'s question (#${answering.num})` : bot ? `Message ${this.label(bot)}` : "No bot selected";
     return h_flex().p(8).gap(6).flex_none().border_t_1().border_color(t.border).items_end()
       .when(Boolean(this.answering), (el) => el.child(this.button(t, "unanswer", "×", (cx) => { this.answering = null; cx.notify(); })))
       .child(v_flex().flex_1().gap(2)
