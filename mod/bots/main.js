@@ -571,6 +571,12 @@ export default class Bots extends View {
         .child(div().flex_shrink_0().font_medium().whitespace_normal().text_color(t.muted).child(pending.text))));
   }
 
+  canCloseAsDone(i) {
+    if (i.status === "needs_you") return true;
+    if (i.status !== "working") return false;
+    return this.snap.workers.some((w) => w.bot === i.bot && w.item_id === i.num && w.status === "running");
+  }
+
   // In the chat a reply shows in full: the chat area scrolls. The all-bots window caps it.
   renderItem(t, i, fullReply = false) {
     const color = { needs_you: t.blocked, working: t.working, planned: t.muted, done: t.done, canceled: t.dim }[i.status];
@@ -584,9 +590,16 @@ export default class Bots extends View {
         .child(div().text_size(11).text_color(color).child(i.status.replace("_", " ")))
         .child(div().text_size(11).text_color(t.dim).child(i.source))
         .child(div().flex_1())
+        // Done closes an item by hand: for a question you settled yourself, or a turn that is
+        // over with only its workers still out. While the bot is on its turn neither Done nor
+        // Cancel stops it (Pause does), so Done stays hidden then and Cancel says what it does.
+        .when(this.canCloseAsDone(i), (el) => el
+          .child(this.button(t, `done-${i.key}`, "Done", (cx) => this.run(cx, i.daemon, ["done", String(i.num)]))
+            .tooltip("Close it as done")))
         .when(!["done", "canceled"].includes(i.status), (el) => el
-          .child(this.button(t, `done-${i.key}`, "Done", (cx) => this.run(cx, i.daemon, ["done", String(i.num)])))
-          .child(this.button(t, `cancel-${i.key}`, "Cancel", (cx) => this.run(cx, i.daemon, ["cancel", String(i.num)])))))
+          .child(this.button(t, `cancel-${i.key}`, "Cancel", (cx) => this.run(cx, i.daemon, ["cancel", String(i.num)]))
+            .tooltip(i.status === "working" ? "Stop waiting for it. The bot's current turn keeps going; Pause stops it."
+              : i.status === "planned" ? "Drop it before it runs" : "Close it without an answer"))))
       .child(div().flex_shrink_0().font_medium().whitespace_normal().child(i.title))
       .when(Boolean(i.question), (el) => el.child(
         h_flex().id(`ask-${i.key}`).gap(6).p(6).rounded(6).bg(t.background).cursor_pointer()
