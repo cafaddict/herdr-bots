@@ -1,6 +1,7 @@
 #!/bin/sh
 # A stand-in for herdr-core's `hc`, enough for the daemon's integration test.
-# Terminals are folders under $FAKE_HC_DIR/<name>/ holding `cwd`, `argv` and `log`.
+# Terminals are folders under $FAKE_HC_DIR/<name>/ holding `cwd`, `argv` and `log`;
+# `rm` moves one to $FAKE_HC_DIR/.removed/<name>/.
 # A "turn" (send --wait) answers at once: it writes "fake reply" to the outbox file the
 # message names, the way a real bot following HERDR-BOTS.md would.
 set -eu
@@ -44,7 +45,10 @@ case "$cmd" in
     elif [ -n "$n" ]; then mkdir -p "$(cat "$t/cwd")/outbox"; echo "fake reply $n" > "$(cat "$t/cwd")/outbox/$n.md"; fi
     echo '{"started":1,"status":"working","turn":1,"wait":{"ended":true,"reason":"done","status":"done","exit_code":null}}' ;;
   read) cat "$t/log" 2>/dev/null || true ;;
-  rm) rm -rf "$t"; echo '{"removed":"t1"}' ;;
+  rm)
+    mkdir -p "$dir/.removed"; rm -rf "$dir/.removed/$name"
+    [ ! -d "$t" ] || mv "$t" "$dir/.removed/$name"
+    echo '{"removed":"t1"}' ;;
   interrupt|kill) echo '{}' ;;
   *) echo "{\"error\":{\"kind\":\"unsupported\",\"message\":\"$cmd\"}}"; exit 2 ;;
 esac

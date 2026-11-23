@@ -48,8 +48,8 @@ git clone https://github.com/cafaddict/herdr-bots && cd herdr-bots
    `main-bots` is your layout now: Herdr updates to `main` don't reach it. To go back, run
    `herdr-app do layout.switch '{"name":"main"}'`.
 
-"All" in the sidebar header opens everything at once: every bot, item and worker. The same view
-also opens with `herdr-app do mod.open '{"name":"bots"}'`.
+"All" in the sidebar header opens everything at once: every bot, item and running worker. The
+same view also opens with `herdr-app do mod.open '{"name":"bots"}'`.
 
 ## A bot
 
@@ -100,7 +100,9 @@ things:
   back into `bots/<id>`.
 
 If the bot has workers running, `rm` refuses. `--force` (or the checkbox in the dialog) stops the
-workers too. Their git worktrees are kept.
+workers too. Each stopped worker is then cleaned up like a finished one (see the worker step in
+[How a turn works](#how-a-turn-works)): its worktree is removed if it is clean and kept if it has
+uncommitted changes. Its branch stays.
 
 The daemon reloads a bot within 5 seconds after you save its `bot.toml`. A broken `bot.toml`
 shows up as an error in the panel and in `herdr-bots status` instead of stopping the daemon.
@@ -121,8 +123,12 @@ shows up as an error in the panel and in `herdr-bots status` instead of stopping
    - It runs `herdr-bots needs-you <n> "question"`. You answer in the panel, and the item runs again.
    - It runs `herdr-bots worker-start --item <n> --repo <path> --spec "..."`. That command
      creates the branch `bot/<bot>-<n>-<k>` in a new worktree and starts an agent there. When the
-     worker's turn ends, its report (PR link and summary from `herdr-bots worker-done`) comes back
-     to the bot as a new turn on the same item.
+     worker's turn ends, the daemon ends the worker's terminal and removes its worktree if it is
+     clean (`git worktree remove` without `--force`). A worktree with uncommitted or untracked
+     changes is kept, and the branch is never deleted. Then the worker's report (PR link and
+     summary from `herdr-bots worker-done`, and whether the worktree was removed) comes back to
+     the bot as a new turn on the same item. A worker stuck on a permission dialog keeps its
+     terminal and worktree, so you can answer the dialog there.
 
 A bot runs one turn at a time. Workers run in parallel.
 
