@@ -64,6 +64,10 @@ if [ -d "$app_home" ] && have_app && command -v python3 >/dev/null 2>&1; then
   echo "==> adding Bots to $layout_name (sidebar list, Bots button and right-panel chat)"
   python3 "$here/mod/setup_layout.py" "$app_home" "$layout_name"
   app do layout.switch "{\"name\":\"$layout_name\"}" >/dev/null || true
+  # Herdr may dock the new tabs-bots folder into the layout a moment after it appears; run the
+  # (idempotent) setup again to take that stray block back out.
+  sleep 2
+  python3 "$here/mod/setup_layout.py" "$app_home" "$layout_name"
 fi
 
 echo "==> registering and starting the daemon"

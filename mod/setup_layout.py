@@ -55,9 +55,28 @@ def make_tabs_copy(app: Path) -> bool:
     return True
 
 
+def drop_stray_tabs(node) -> int:
+    """Removes title-bar copies Herdr docked on its own. The first time Herdr sees the new
+    mods/tabs-bots folder it can dock a copy of it into the shown layout (a 320 px column at
+    the window's edge), separately from this script. Only the block with id `tabs` should hold it."""
+    removed = 0
+    if isinstance(node, dict) and isinstance(node.get("children"), list):
+        keep = []
+        for child in node["children"]:
+            if (child.get("content") or {}).get("mod") == "tabs-bots" and child.get("id") != "tabs":
+                removed += 1
+                continue
+            removed += drop_stray_tabs(child)
+            keep.append(child)
+        node["children"] = keep
+    return removed
+
+
 def patch_layout(path: Path, tabs_ok: bool) -> None:
     doc = json.loads(path.read_text())
     root = doc.get("root", doc)
+    if drop_stray_tabs(root):
+        print("removed a stray tabs-bots block Herdr had docked")
 
     lists = find(root, "sidebar-lists")
     if lists is not None and not find(lists, "bots"):
