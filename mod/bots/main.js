@@ -10,6 +10,10 @@
 //
 // The daemon writes ~/.herdr-bots/state/status.json on every change; this mod watches that
 // folder and calls the `herdr-bots` CLI for actions. A bot's live agent opens as a window.
+//
+// The daemon may run on another machine than this window: a WSL distro or a server the window
+// reaches over hc (`hc machine ls`). config.js then names it in MACHINE, with the daemon's
+// state folder in STATE_DIR, and every file read and command goes there.
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView } from "gpui-base";
@@ -17,11 +21,18 @@ import {
   exec, home, checking, readTextFile, watchFolder, terminals, openOverlay, closeOverlay,
   notify, setBadge, playSound, props, theme, layout, run, shared, setShared,
 } from "herdr";
-import { BIN } from "./config.js";
+// A namespace import, so a config.js written before MACHINE/STATE_DIR existed still loads.
+import * as config from "./config.js";
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const stateDir = () => `${home()}/.herdr-bots/state`;
-const terminalOf = (bot) => terminals().find((t) => t.name === `bot-${bot}` && t.state === "live");
+const BIN = config.BIN;
+const MACHINE = config.MACHINE ?? null;   // null: the daemon runs on this computer
+const stateDir = () => config.STATE_DIR ?? `${home()}/.herdr-bots/state`;
+const readStatus = () => readTextFile(`${stateDir()}/status.json`, { on: MACHINE }).catch(() => null);
+const bots = (args) => exec(BIN, args, { on: MACHINE }).catch((e) => ({ code: 1, stderr: String(e) }));
+// Another machine's terminals have addresses like "wsl/t3"; this computer's are bare ("t3").
+const onDaemonMachine = (t) => (MACHINE ? String(t.address).startsWith(`${MACHINE}/`) : !String(t.address).includes("/"));
+const terminalOf = (bot) => terminals().find((t) => t.name === `bot-${bot}` && t.state === "live" && onDaemonMachine(t));
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -78,20 +89,28 @@ export default class Bots extends View {
     this.input.on("submit", (_e, cx) => this.send(cx));
     if (checking()) return;
     this.reload(cx);
-    cx.spawn(async (cx) => {
-      for (;;) {
-        try { await watchFolder(stateDir()); } catch { await new Promise((r) => cx.timer.after(5000, r)); }
-        this.reload(cx);
-      }
-    });
-    // The folder may not exist until the daemon first starts; poll gently as a fallback.
-    cx.timer.every(15000, (cx) => this.reload(cx));
+    if (MACHINE) {
+      // watchFolder sees only this computer: read the other machine's status file instead.
+      // reload() redraws only when the text changed.
+      cx.timer.every(2000, (cx) => this.reload(cx));
+    } else {
+      cx.spawn(async (cx) => {
+        for (;;) {
+          try { await watchFolder(stateDir()); } catch { await new Promise((r) => cx.timer.after(5000, r)); }
+          this.reload(cx);
+        }
+      });
+      // The folder may not exist until the daemon first starts; poll gently as a fallback.
+      cx.timer.every(15000, (cx) => this.reload(cx));
+    }
     if (this.mode === "chat") cx.timer.after(300, () => this.input.focus());
   }
 
   reload(cx) {
     cx.spawn(async (cx) => {
-      const text = await readTextFile(`${stateDir()}/status.json`).catch(() => null);
+      const text = await readStatus();
+      if (text === this.lastText && this.snap) return;
+      this.lastText = text;
       if (!text) { this.snap = null; cx.notify(); return; }
       try { this.snap = JSON.parse(text); } catch { return; } // mid-write; the next change rereads
       if (this.mode === "full" && !this.snap.bots.some((b) => b.id === this.selected)) this.selected = this.snap.bots[0]?.id ?? null;
@@ -127,7 +146,7 @@ export default class Bots extends View {
 
   run(cx, args) {
     cx.spawn(async (cx) => {
-      const r = await exec(BIN, args).catch((e) => ({ code: 1, stderr: String(e) }));
+      const r = await bots(args);
       this.error = r.code === 0 ? null : (r.stderr || r.stdout || "failed").trim();
       cx.notify();
     });
@@ -335,7 +354,7 @@ export default class Bots extends View {
     if (checking()) return;
     cx.timer.after(100, () => this.handle.focus());
     cx.spawn(async (cx) => {
-      const text = await readTextFile(`${stateDir()}/status.json`).catch(() => null);
+      const text = await readStatus();
       try {
         const snap = JSON.parse(text ?? "{}");
         this.workers = (snap.workers ?? []).filter((w) => w.bot === this.target && w.status === "running").length;
@@ -351,7 +370,7 @@ export default class Bots extends View {
     const args = ["rm", this.target];
     if (this.force) args.push("--force");
     cx.spawn(async (cx) => {
-      const r = await exec(BIN, args).catch((e) => ({ code: 1, stderr: String(e) }));
+      const r = await bots(args);
       this.busy = false;
       if (r.code !== 0) { this.error = (r.stderr || r.stdout || "failed").trim(); cx.notify(); return; }
       if (shared("bots.chat") === this.target) setShared("bots.chat", null);
@@ -409,7 +428,7 @@ export default class Bots extends View {
     const role = this.newRole.value().trim();
     if (role) args.push("--role", role);
     cx.spawn(async (cx) => {
-      const r = await exec(BIN, args).catch((e) => ({ code: 1, stderr: String(e) }));
+      const r = await bots(args);
       this.busy = false;
       if (r.code !== 0) { this.error = (r.stderr || r.stdout || "failed").trim(); cx.notify(); return; }
       closeOverlay(props().overlay);

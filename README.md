@@ -48,6 +48,31 @@ git clone https://github.com/cafaddict/herdr-bots && cd herdr-bots
    `main-bots` is your layout now: Herdr updates to `main` don't reach it. To go back, run
    `herdr-app do layout.switch '{"name":"main"}'`.
 
+### The Herdr window on another machine
+
+The daemon and the panel can run on different machines. A common case: the Windows Herdr app
+with the daemon in WSL, where the app reaches WSL as an hc machine. Run `install.sh` in WSL and
+point it at the Windows app:
+
+```bash
+HERDR_APP_HOME=/mnt/c/Users/<you>/.config/herdr-app \
+HERDR_APP_BIN=/mnt/c/Users/<you>/AppData/Local/Programs/herdr-app/herdr-app.exe \
+HERDR_BOTS_MACHINE=wsl \
+./install.sh
+```
+
+- `HERDR_APP_HOME`: the app's folder, where the mod and the layout go.
+- `HERDR_APP_BIN`: the app's `herdr-app`. A Windows `.exe` gets Windows paths and a closed stdin.
+- `HERDR_BOTS_MACHINE`: the name the window gives the daemon's machine (`hc machine ls` on the
+  window's side). The mod then reads `status.json` and runs `herdr-bots` on that machine, and
+  reads the status file every 2 seconds instead of watching the folder, since Herdr watches
+  folders only on its own computer.
+- `HERDR_BOTS_LAYOUT`: the layout to add Bots to, default `main-bots`. Name one of your own
+  layouts to keep its other changes. It is patched in place, not copied.
+
+If the window can't see the daemon's files at all (a server you reach over ssh), install the
+mod on the window's side by hand and set `MACHINE` and `STATE_DIR` in its `config.js`.
+
 "All" in the sidebar header opens everything at once: every bot, item and worker. The same view
 also opens with `herdr-app do mod.open '{"name":"bots"}'`.
 

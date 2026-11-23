@@ -10,7 +10,8 @@ Herdr's own layouts and mods are read-only (replaced on every start), so this wo
 * mods/tabs-bots/         a fresh copy of Herdr's current `tabs` mod on every run, with a
   "Bots" button next to Files and Changes. Re-copying keeps it in step with Herdr updates.
 
-Usage: setup_layout.py <herdr app home>
+Usage: setup_layout.py <herdr app home> [layout]   (layout: default main-bots; any layout of
+yours, such as one you already customised, gets the same three changes)
 """
 
 import json
@@ -80,8 +81,9 @@ def patch_layout(path: Path, tabs_ok: bool) -> None:
 
 def main() -> None:
     app = Path(sys.argv[1]).expanduser()
+    layout = sys.argv[2] if len(sys.argv) > 2 else "main-bots"
     tabs_ok = make_tabs_copy(app)
-    patch_layout(app / "layouts" / "main-bots.json", tabs_ok)
+    patch_layout(app / "layouts" / f"{layout}.json", tabs_ok)
 
 
 if __name__ == "__main__":
