@@ -151,26 +151,29 @@ export default class Bots extends View {
   }
 
   reload(cx) {
-    if (!this.daemonList) return;
-    cx.spawn(async (cx) => {
-      const texts = await Promise.all(this.daemonList.map(readStatusOf));
-      const joined = JSON.stringify(texts);
-      if (joined === this.lastText && this.snap) return;
-      const list = [];
-      for (const [n, text] of texts.entries()) {
-        let snap = null;
-        try { snap = text ? JSON.parse(text) : null; } catch { return; } // mid-write; the next change rereads
-        list.push({ daemon: this.daemonList[n], snap });
-      }
-      this.lastText = joined;
-      this.loaded = true;
-      this.snap = list.some((x) => x.snap) ? mergeSnaps(list) : null;
-      if (!this.snap) { cx.notify(); return; }
-      if (this.mode === "full" && !this.snap.bots.some((b) => b.id === this.selected)) this.selected = this.snap.bots[0]?.id ?? null;
-      // The sidebar copy is always shown, so it alone owns the badge and the alerts.
-      if (this.mode === "sidebar") this.announce();
-      cx.notify();
-    });
+    cx.spawn(async (cx) => { if (await this.load()) cx.notify(); });
+  }
+
+  // Reads every daemon's status. True when something changed and the view should redraw.
+  async load() {
+    if (!this.daemonList) return false;
+    const texts = await Promise.all(this.daemonList.map(readStatusOf));
+    const joined = JSON.stringify(texts);
+    if (joined === this.lastText && this.snap) return false;
+    const list = [];
+    for (const [n, text] of texts.entries()) {
+      let snap = null;
+      try { snap = text ? JSON.parse(text) : null; } catch { return false; } // mid-write; the next change rereads
+      list.push({ daemon: this.daemonList[n], snap });
+    }
+    this.lastText = joined;
+    this.loaded = true;
+    this.snap = list.some((x) => x.snap) ? mergeSnaps(list) : null;
+    if (!this.snap) return true;
+    if (this.mode === "full" && !this.snap.bots.some((b) => b.id === this.selected)) this.selected = this.snap.bots[0]?.id ?? null;
+    // The sidebar copy is always shown, so it alone owns the badge and the alerts.
+    if (this.mode === "sidebar") this.announce();
+    return true;
   }
 
   // Dock badge = open questions; a sound and a toast for each new one.
@@ -196,13 +199,20 @@ export default class Bots extends View {
     if (answering) args.push("--item", String(answering.num));
     this.input.set_value("");
     this.answering = null;
+    // Shown at once; the daemon's own item replaces it after the next read (a few seconds on
+    // another machine, where the status file is read every 2 s over hc).
+    this.pending = { bot: bot.id, text, answering: answering ? answering.num : null };
     this.run(cx, bot.daemon, args);
   }
 
+  // Runs a herdr-bots command on that daemon, then rereads at once so the change shows.
   run(cx, daemon, args) {
+    cx.notify();
     cx.spawn(async (cx) => {
       const r = await runOn(daemon, args);
       this.error = r.code === 0 ? null : (r.stderr || r.stdout || "failed").trim();
+      await this.load();
+      this.pending = null;
       cx.notify();
     });
   }
@@ -549,8 +559,16 @@ export default class Bots extends View {
   renderItems(t, chatOrder) {
     let items = this.snap.items.filter((i) => i.bot === this.selected);
     items = chatOrder ? [...items].sort((a, b) => a.num - b.num).slice(-20) : items.slice(0, 20);
-    if (!items.length) return div().p(12).text_color(t.dim).child("Nothing yet. Say something below.");
-    return v_flex().children(items.map((i) => this.renderItem(t, i, chatOrder)));
+    const pending = chatOrder && this.pending?.bot === this.selected ? this.pending : null;
+    if (!items.length && !pending) return div().p(12).text_color(t.dim).child("Nothing yet. Say something below.");
+    return v_flex().children(items.map((i) => this.renderItem(t, i, chatOrder)))
+      .when(Boolean(pending), (el) => el.child(v_flex().id("item-pending").flex_shrink_0().px(12).py(8).gap(4)
+        .border_b_1().border_color(t.border)
+        .child(h_flex().gap(6).items_center()
+          .child(div().text_size(11).text_color(t.dim).child(pending.answering ? `#${pending.answering}` : "new"))
+          .child(div().text_size(11).text_color(t.muted).frames(SPINNER, 90))
+          .child(div().text_size(11).text_color(t.muted).child("sending…")))
+        .child(div().flex_shrink_0().font_medium().whitespace_normal().text_color(t.muted).child(pending.text))));
   }
 
   // In the chat a reply shows in full: the chat area scrolls. The all-bots window caps it.
