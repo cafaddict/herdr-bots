@@ -132,12 +132,22 @@ async fn report_back(app: &App, w: &Worker, end: anyhow::Result<TurnEnd>) {
             ("failed", "could not run")
         }
     };
+    if status == "failed" && end.is_ok() {
+        warn!(worker = w.name, "worker {note}");
+    }
     let finished = {
         let store = app.store();
         let done = store
             .finish_worker(&w.name, status, None, None)
             .ok()
             .flatten();
+        if status == "failed" && done.as_ref().is_some_and(|d| d.summary.is_none()) {
+            let reason = match &end {
+                Err(e) => format!("{note}: {e:#}"),
+                Ok(_) => note.to_owned(),
+            };
+            let _ = store.report_worker(&w.name, None, &reason);
+        }
         let still_open = store
             .item(w.item_id)
             .is_ok_and(|i| i.status == Status::Working);
