@@ -9,7 +9,7 @@ use crate::hc::{AgentStatus, Hc, HcError, WaitOutcome};
 const WAIT_SECS: u64 = 300;
 /// Readiness check-ins before giving up on a freshly started agent.
 const READY_CHECKINS: u32 = 18; // x 10 s
-/// Pause before looking again once the trust keys are sent.
+/// Pause after pressing the trust keys before looking at the screen again.
 const TRUST_REDRAW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The command line for an interactive agent session (never a one-shot print mode: hc's rule,
@@ -103,7 +103,6 @@ pub async fn ensure_agent(
 /// trusting them is ours to answer. Anything else on first start (Claude's one-time consent to
 /// bypass permissions) is the person's call: that comes back as `Blocked`.
 async fn settle(hc: &Hc, name: &str) -> Result<Readiness, AgentError> {
-    let mut trusted = false;
     for _ in 0..READY_CHECKINS {
         let w = hc.wait(name, 10).await?;
         if w.reason.as_deref() == Some("exit") {
@@ -117,13 +116,13 @@ async fn settle(hc: &Hc, name: &str) -> Result<Readiness, AgentError> {
         match start_step(w.status, &screen) {
             StartStep::Ready => return Ok(Readiness::Ready),
             StartStep::Blocked => return Ok(Readiness::Blocked),
-            StartStep::Trust(keys) if !trusted => {
+            // Claude drops keys that arrive before it takes input, which hc's `blocked` can
+            // precede, so this presses again while the dialog stays. The keys follow the
+            // cursor, so a press that only moved it is finished, not undone.
+            StartStep::Trust(keys) => {
                 hc.keys(name, keys).await?;
-                trusted = true;
+                tokio::time::sleep(TRUST_REDRAW).await;
             }
-            // hc still reports the dialog for a moment after the keys: pressing them again
-            // would land on the prompt.
-            StartStep::Trust(_) => tokio::time::sleep(TRUST_REDRAW).await,
             StartStep::Wait => {}
         }
     }
@@ -170,11 +169,17 @@ fn first_start_dialog(screen: &str) -> Option<Dialog> {
     }
     // Claude Code: "❯ No, exit / Yes, I trust this folder" (older: "Yes, proceed" first).
     if screen.contains("Yes, I trust this folder") {
+        let cursor_on = |option: &str| {
+            screen
+                .lines()
+                .any(|l| l.contains('❯') && l.contains(option))
+        };
         let no_first = screen
             .find("No, exit")
             .is_some_and(|no| Some(no) < screen.find("Yes, I trust this folder"));
+        let on_no = cursor_on("No, exit") || (no_first && !cursor_on("Yes, I trust this folder"));
         return Some(Dialog::FolderTrust {
-            keys: if no_first {
+            keys: if on_no {
                 &["down", "enter"]
             } else {
                 &["enter"]
@@ -245,6 +250,20 @@ mod tests {
         assert_eq!(
             start_step(None, trust),
             StartStep::Trust(&["down", "enter"])
+        );
+    }
+
+    #[test]
+    fn trust_keys_follow_the_cursor() {
+        let moved = " ❯ Yes, I trust this folder\n   No, exit";
+        assert_eq!(
+            start_step(Some(AgentStatus::Blocked), moved),
+            StartStep::Trust(&["enter"])
+        );
+        let half_pressed = "   No, exit\n ❯ Yes, I trust this folder\n Enter to confirm";
+        assert_eq!(
+            start_step(Some(AgentStatus::Blocked), half_pressed),
+            StartStep::Trust(&["enter"])
         );
     }
 
