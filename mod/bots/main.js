@@ -799,7 +799,7 @@ export default class Bots extends View {
         .on_click((_e, cx) => { this.force = !this.force; this.error = null; cx.notify(); })
         .child(div().w(16).h(16).rounded(4).border_1().border_color(this.force ? t.blocked : t.input)
           .bg(this.force ? t.blocked : t.background).text_size(11).text_color(t.background).child(this.force ? "✓" : ""))
-        .child(div().text_size(12.5).child(`Also stop its ${this.workers} running worker${this.workers > 1 ? "s" : ""} (worktrees are kept)`))))
+        .child(div().text_size(12.5).child(`Also stop its ${this.workers} running worker${this.workers > 1 ? "s" : ""} (worktrees with uncommitted changes are kept)`))))
       .when(Boolean(this.error), (el) => el.child(div().text_size(11.5).text_color(t.blocked).child(this.error)))
       .child(h_flex().pt(12).gap(8).justify_end()
         .child(this.button(t, "del-cancel", "Cancel", () => closeOverlay(props().overlay)))
@@ -1005,12 +1005,12 @@ export default class Bots extends View {
   }
 
   renderWorkers(t) {
-    const workers = this.snap.workers.filter((w) => w.bot === this.selected).slice(0, 8);
+    const workers = this.snap.workers.filter((w) => w.bot === this.selected && w.status === "running").slice(0, 8);
     if (!workers.length) return div();
     return v_flex().px(12).py(8).gap(4).flex_shrink_0()
       .child(div().text_size(11).text_color(t.dim).child("WORKERS"))
       .children(workers.map((w) => h_flex().gap(6).items_center()
-        .child(this.dot(t, w.status === "running" ? "working" : w.status === "done" ? "idle" : "needs_you"))
+        .child(this.dot(t, "working"))
         .child(div().text_size(11.5).child(w.name))
         .child(div().flex_1().min_w(0).text_size(11).text_color(t.muted).truncate().child(w.pr_url ?? w.branch))));
   }

@@ -273,12 +273,25 @@ fn worker_gets_its_own_worktree() {
     let branch = format!("bot/dev-{id}-1");
     assert_eq!(w["branch"], branch.as_str());
     let worktree = PathBuf::from(w["worktree"].as_str().unwrap());
-    assert!(worktree.starts_with(&wt) && worktree.join(".git").exists());
+    assert!(worktree.starts_with(&wt));
     d.until("worker finished", || {
         d.status()["workers"][0]["status"] == "done"
     });
-    let log = std::fs::read_to_string(d.fake.join(format!("w{id}-1/log"))).unwrap();
-    assert!(log.contains("do the fix") && log.contains(&format!("worker-done w{id}-1")));
+    // Its terminal is ended and its clean worktree removed; the branch stays.
+    let name = format!("w{id}-1");
+    assert!(!d.fake.join(&name).exists(), "terminal removed");
+    let terminal = d.fake.join(".removed").join(&name);
+    let cwd = std::fs::read_to_string(terminal.join("cwd")).unwrap();
+    assert_eq!(Path::new(&cwd), worktree);
+    let log = std::fs::read_to_string(terminal.join("log")).unwrap();
+    assert!(log.contains("do the fix") && log.contains(&format!("worker-done {name}")));
+    assert!(!worktree.exists(), "clean worktree removed");
+    git(&[
+        "rev-parse",
+        "--verify",
+        "-q",
+        &format!("refs/heads/{branch}"),
+    ]);
     // A finished item can't get workers.
     d.cli(&["cancel", &id]).unwrap();
     assert!(

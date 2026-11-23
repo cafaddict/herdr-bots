@@ -135,6 +135,11 @@ async fn report_back(app: &App, w: &Worker, end: anyhow::Result<TurnEnd>) {
     if status == "failed" && end.is_ok() {
         warn!(worker = w.name, "worker {note}");
     }
+    // A blocked worker keeps its terminal: the owner may answer the dialog there.
+    let cleanup = match &end {
+        Ok(TurnEnd::Blocked) => None,
+        _ => Some(clean_up(app, w).await),
+    };
     let finished = {
         let store = app.store();
         let done = store
@@ -159,6 +164,9 @@ async fn report_back(app: &App, w: &Worker, end: anyhow::Result<TurnEnd>) {
         "worker {} ({}, branch {}) {note}.",
         done.name, done.worktree, done.branch
     );
+    if let Some(cleanup) = &cleanup {
+        text.push_str(&format!(" {}.", cleanup.note()));
+    }
     if let Some(pr) = &done.pr_url {
         text.push_str(&format!(" PR: {pr}."));
     }
@@ -175,6 +183,59 @@ async fn report_back(app: &App, w: &Worker, end: anyhow::Result<TurnEnd>) {
             note: Some(text),
         },
     );
+}
+
+/// Ends a finished worker's terminal, then removes its worktree if it is clean.
+async fn clean_up(app: &App, w: &Worker) -> WorktreeCleanup {
+    let _ = app.hc.kill(&w.name).await;
+    let _ = app.hc.rm(&w.name).await;
+    let cleanup = remove_worktree_if_clean(Path::new(&w.repo), Path::new(&w.worktree)).await;
+    match &cleanup {
+        WorktreeCleanup::Removed => info!(worker = w.name, "worktree removed"),
+        WorktreeCleanup::KeptDirty => warn!(
+            worker = w.name,
+            worktree = w.worktree,
+            "worktree kept: it has uncommitted changes"
+        ),
+        WorktreeCleanup::Kept(e) => warn!(worker = w.name, "worktree kept: {e}"),
+    }
+    cleanup
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorktreeCleanup {
+    Removed,
+    /// git refused because it has uncommitted or untracked changes.
+    KeptDirty,
+    /// git refused for another reason (locked, has submodules, already gone, ...).
+    Kept(String),
+}
+
+impl WorktreeCleanup {
+    /// For the bot. Not git's own text, which suggests `--force`.
+    fn note(&self) -> &'static str {
+        match self {
+            Self::Removed => "Worktree removed",
+            Self::KeptDirty => "Worktree kept: it has uncommitted changes",
+            Self::Kept(_) => "Worktree kept: git would not remove it",
+        }
+    }
+}
+
+/// `git worktree remove` without `--force`, so git refuses a worktree with changes in it.
+/// The branch is never deleted: its commits stay in the repo.
+async fn remove_worktree_if_clean(repo: &Path, worktree: &Path) -> WorktreeCleanup {
+    let Err(e) = git(repo, &["worktree", "remove", &worktree.to_string_lossy()]).await else {
+        return WorktreeCleanup::Removed;
+    };
+    let dirty = git(worktree, &["status", "--porcelain"])
+        .await
+        .is_ok_and(|changes| !changes.trim().is_empty());
+    if dirty {
+        WorktreeCleanup::KeptDirty
+    } else {
+        WorktreeCleanup::Kept(format!("{e:#}"))
+    }
 }
 
 fn worker_message(spec: &str, branch: &str, name: &str, exe: &Path) -> String {
@@ -229,6 +290,61 @@ mod tests {
         assert!(m.starts_with("Fix it"));
         assert!(m.contains("`bot/a-1-1`"));
         assert!(m.contains("/bin/herdr-bots worker-done w1-1"));
+    }
+
+    const AS_TESTER: [&str; 4] = ["-c", "user.email=t@t", "-c", "user.name=t"];
+
+    async fn repo_with_worktree(tmp: &Path, branch: &str) -> (PathBuf, PathBuf) {
+        let repo = tmp.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]).await.unwrap();
+        let init = [
+            &AS_TESTER[..],
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        ]
+        .concat();
+        git(&repo, &init).await.unwrap();
+        let worktree = tmp.join("worktree");
+        let path = worktree.to_string_lossy();
+        git(&repo, &["worktree", "add", "-q", "-b", branch, &path])
+            .await
+            .unwrap();
+        (repo, worktree)
+    }
+
+    #[tokio::test]
+    async fn a_clean_worktree_is_removed_and_its_branch_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, worktree) = repo_with_worktree(tmp.path(), "bot/a-1-1").await;
+        std::fs::write(worktree.join("fix.txt"), "fixed").unwrap();
+        git(&worktree, &["add", "fix.txt"]).await.unwrap();
+        let commit = [&AS_TESTER[..], &["commit", "-q", "-m", "the fix"]].concat();
+        git(&worktree, &commit).await.unwrap();
+
+        assert_eq!(
+            remove_worktree_if_clean(&repo, &worktree).await,
+            WorktreeCleanup::Removed
+        );
+        assert!(!worktree.exists());
+        let log = git(&repo, &["log", "--format=%s", "bot/a-1-1"])
+            .await
+            .unwrap();
+        assert!(
+            log.contains("the fix"),
+            "branch kept with its commit: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worktree_with_uncommitted_work_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, worktree) = repo_with_worktree(tmp.path(), "bot/a-1-1").await;
+        std::fs::write(worktree.join("wip.txt"), "not committed").unwrap();
+
+        let cleanup = remove_worktree_if_clean(&repo, &worktree).await;
+        assert_eq!(cleanup, WorktreeCleanup::KeptDirty);
+        assert_eq!(cleanup.note(), "Worktree kept: it has uncommitted changes");
+        assert!(worktree.join("wip.txt").exists());
     }
 
     #[test]
