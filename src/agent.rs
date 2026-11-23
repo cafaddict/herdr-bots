@@ -9,6 +9,8 @@ use crate::hc::{AgentStatus, Hc, HcError, WaitOutcome};
 const WAIT_SECS: u64 = 300;
 /// Readiness check-ins before giving up on a freshly started agent.
 const READY_CHECKINS: u32 = 18; // x 10 s
+/// Pause after pressing the trust keys before looking at the screen again.
+const TRUST_REDRAW: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The command line for an interactive agent session (never a one-shot print mode: hc's rule,
 /// so a person can attach and take over).
@@ -80,9 +82,9 @@ pub async fn ensure_agent(
 ) -> Result<Readiness, AgentError> {
     match hc.get(name).await? {
         Some(t) if t.is_live() => match t.status {
-            Some(AgentStatus::Blocked) => return Ok(Readiness::Blocked),
+            // Blocked may be the folder-trust dialog, which settle answers.
+            None | Some(AgentStatus::Blocked) => {}
             Some(_) => return Ok(Readiness::Ready),
-            None => {} // still starting, or stuck on a first-start dialog
         },
         Some(_) => {
             hc.rm(name).await?; // a finished one keeps the name until removed
@@ -106,19 +108,50 @@ async fn settle(hc: &Hc, name: &str) -> Result<Readiness, AgentError> {
         if w.reason.as_deref() == Some("exit") {
             return Err(AgentError::ExitedOnStart(name.into(), w.exit_code));
         }
-        match w.status {
-            Some(AgentStatus::Blocked) => return Ok(Readiness::Blocked),
-            Some(AgentStatus::Idle | AgentStatus::Done) => return Ok(Readiness::Ready),
-            _ => {}
-        }
-        let screen = hc.read(name, 0).await.unwrap_or_default();
-        match first_start_dialog(&screen) {
-            Some(Dialog::FolderTrust { keys }) => hc.keys(name, keys).await?,
-            Some(Dialog::NeedsPerson) => return Ok(Readiness::Blocked),
-            None => {}
+        let screen = if is_ready(w.status) {
+            String::new()
+        } else {
+            hc.read(name, 0).await.unwrap_or_default()
+        };
+        match start_step(w.status, &screen) {
+            StartStep::Ready => return Ok(Readiness::Ready),
+            StartStep::Blocked => return Ok(Readiness::Blocked),
+            // Claude drops keys that arrive before it takes input, which hc's `blocked` can
+            // precede, so this presses again while the dialog stays. The keys follow the
+            // cursor, so a press that only moved it is finished, not undone.
+            StartStep::Trust(keys) => {
+                hc.keys(name, keys).await?;
+                tokio::time::sleep(TRUST_REDRAW).await;
+            }
+            StartStep::Wait => {}
         }
     }
     Err(AgentError::NotReady(name.into()))
+}
+
+fn is_ready(status: Option<AgentStatus>) -> bool {
+    matches!(status, Some(AgentStatus::Idle | AgentStatus::Done))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartStep {
+    Ready,
+    Blocked,
+    Trust(&'static [&'static str]),
+    Wait,
+}
+
+/// hc reports the folder-trust dialog as `blocked` too, so the screen decides before the status.
+fn start_step(status: Option<AgentStatus>, screen: &str) -> StartStep {
+    if is_ready(status) {
+        return StartStep::Ready;
+    }
+    match first_start_dialog(screen) {
+        Some(Dialog::FolderTrust { keys }) => StartStep::Trust(keys),
+        Some(Dialog::NeedsPerson) => StartStep::Blocked,
+        None if status == Some(AgentStatus::Blocked) => StartStep::Blocked,
+        None => StartStep::Wait,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -136,11 +169,17 @@ fn first_start_dialog(screen: &str) -> Option<Dialog> {
     }
     // Claude Code: "❯ No, exit / Yes, I trust this folder" (older: "Yes, proceed" first).
     if screen.contains("Yes, I trust this folder") {
+        let cursor_on = |option: &str| {
+            screen
+                .lines()
+                .any(|l| l.contains('❯') && l.contains(option))
+        };
         let no_first = screen
             .find("No, exit")
             .is_some_and(|no| Some(no) < screen.find("Yes, I trust this folder"));
+        let on_no = cursor_on("No, exit") || (no_first && !cursor_on("Yes, I trust this folder"));
         return Some(Dialog::FolderTrust {
-            keys: if no_first {
+            keys: if on_no {
                 &["down", "enter"]
             } else {
                 &["enter"]
@@ -198,6 +237,54 @@ mod tests {
         let bypass = "WARNING: Claude Code running in Bypass Permissions mode\n ❯ No, exit\n   Yes, I accept";
         assert_eq!(first_start_dialog(bypass), Some(Dialog::NeedsPerson));
         assert_eq!(first_start_dialog("> try \"fix lint errors\""), None);
+    }
+
+    #[test]
+    fn a_blocked_folder_trust_dialog_is_answered() {
+        let trust = " Accessing workspace:\n\n /home/me/.herdr/worktrees/repo/bot/cos-9-1\n\n \
+                     ❯ No, exit\n   Yes, I trust this folder\n\n Enter to confirm · Esc to cancel";
+        assert_eq!(
+            start_step(Some(AgentStatus::Blocked), trust),
+            StartStep::Trust(&["down", "enter"])
+        );
+        assert_eq!(
+            start_step(None, trust),
+            StartStep::Trust(&["down", "enter"])
+        );
+    }
+
+    #[test]
+    fn trust_keys_follow_the_cursor() {
+        let moved = " ❯ Yes, I trust this folder\n   No, exit";
+        assert_eq!(
+            start_step(Some(AgentStatus::Blocked), moved),
+            StartStep::Trust(&["enter"])
+        );
+        let half_pressed = "   No, exit\n ❯ Yes, I trust this folder\n Enter to confirm";
+        assert_eq!(
+            start_step(Some(AgentStatus::Blocked), half_pressed),
+            StartStep::Trust(&["enter"])
+        );
+    }
+
+    #[test]
+    fn other_start_states() {
+        let bypass = "WARNING: Claude Code running in Bypass Permissions mode\n ❯ No, exit\n   Yes, I accept";
+        assert_eq!(
+            start_step(Some(AgentStatus::Blocked), bypass),
+            StartStep::Blocked
+        );
+        assert_eq!(
+            start_step(Some(AgentStatus::Blocked), "Allow this tool?"),
+            StartStep::Blocked
+        );
+        assert_eq!(start_step(Some(AgentStatus::Idle), ""), StartStep::Ready);
+        assert_eq!(start_step(Some(AgentStatus::Done), ""), StartStep::Ready);
+        assert_eq!(start_step(None, "starting"), StartStep::Wait);
+        assert_eq!(
+            start_step(Some(AgentStatus::Working), "starting"),
+            StartStep::Wait
+        );
     }
 
     #[test]
