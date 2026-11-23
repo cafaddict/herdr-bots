@@ -24,7 +24,7 @@ import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextView, ScrollHandle, EditorState, Editor } from "gpui-base";
 import {
   exec, home, appHome, checking, readTextFile, watchFolder, terminals, openOverlay, closeOverlay,
-  notify, setBadge, playSound, props, theme, layout, run, shared, setShared,
+  notify, setBadge, playSound, props, theme, layout, run, shared, setShared, window as appWindow,
 } from "herdr";
 // A namespace import, so a config.js written before MACHINE/STATE_DIR existed still loads.
 import * as config from "./config.js";
@@ -113,12 +113,83 @@ function openChat(bot) {
 
 const BOT_ID = /^[a-z0-9_-]{1,24}$/;
 
+// ---------- attachments ----------
+//
+// A bot is a Claude Code / Codex session, which opens a file it is given the path of. So an
+// attachment is a file put into the bot's folder (inbox/) on the daemon's machine, and the
+// message names its path. Files come from a drop on the chat, or from a pasted image, which
+// is saved to a PNG on this computer first (no mod API reads clipboard images).
+
+const ATTACH_MAX = 6 * 1024 * 1024;   // exec output is capped at 8 MiB, and base64 adds a third
+const ARG_CHUNK = 120000;             // base64 chars per argument: under Linux's 128 KiB per-argument limit, a multiple of 4
+const CHUNKS_PER_CALL = 12;           // ~1.4 MB of arguments per call
+const INBOX_DAYS = 7;                 // files in a bot's inbox/ older than this go at the next upload
+const baseName = (path) => String(path).split(/[\\/]/).pop() || "file";
+const safeName = (name) => name.replace(/[^A-Za-z0-9._-]+/g, "_").slice(-80) || "file";
+
+// Saves the clipboard's image as a PNG at `dest` on this computer. Null on success, else why.
+async function saveClipboardImage(dest) {
+  const platform = appWindow()?.platform;
+  let r;
+  if (platform === "windows") {
+    const q = dest.replace(/'/g, "''");
+    r = await exec("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+      "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; " +
+      "$img=[System.Windows.Forms.Clipboard]::GetImage(); if ($img -eq $null) { exit 3 }; " +
+      `New-Item -ItemType Directory -Force -Path (Split-Path -Parent '${q}') | Out-Null; ` +
+      `$img.Save('${q}', [System.Drawing.Imaging.ImageFormat]::Png)`]).catch((e) => ({ code: 1, stderr: String(e) }));
+  } else if (platform === "macos") {
+    r = await exec("sh", ["-c", 'mkdir -p "$(dirname "$1")" && osascript -e "set f to (open for access POSIX file \\"$1\\" with write permission)" -e "write (the clipboard as «class PNGf») to f" -e "close access f"', "paste", dest])
+      .catch((e) => ({ code: 1, stderr: String(e) }));
+  } else {
+    r = await exec("sh", ["-c", 'mkdir -p "$(dirname "$1")" && { wl-paste --type image/png > "$1" 2>/dev/null || xclip -selection clipboard -t image/png -o > "$1"; } && [ -s "$1" ]', "paste", dest])
+      .catch((e) => ({ code: 1, stderr: String(e) }));
+  }
+  if (r.code === 3) return "the clipboard holds no image";
+  return r.code === 0 ? null : (r.stderr || r.stdout || `exit ${r.code}`).trim().slice(0, 200);
+}
+
+// This computer's file as base64, or throws.
+async function readBase64(path) {
+  const platform = appWindow()?.platform;
+  const r = platform === "windows"
+    ? await exec("powershell", ["-NoProfile", "-NonInteractive", "-Command",
+      `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${path.replace(/'/g, "''")}'))`])
+    : await exec("base64", platform === "macos" ? ["-i", path] : ["-w0", path]);
+  if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim().slice(0, 200));
+  return r.stdout.replace(/\s+/g, "");
+}
+
+// Puts this computer's `path` at `dest` on the daemon's machine; returns `dest`.
+async function putOnDaemon(daemon, path, dest) {
+  if (!daemon.machine) {
+    const r = await exec("sh", ["-c", 'mkdir -p "$(dirname "$2")" && cp -f "$1" "$2"', "put", path, dest]);
+    if (r.code !== 0) throw new Error((r.stderr || "copy failed").trim());
+    return dest;
+  }
+  const b64 = await readBase64(path);
+  if (b64.length > (ATTACH_MAX * 4) / 3 + 4) throw new Error(`${baseName(path)} is over ${ATTACH_MAX / 1048576} MB`);
+  const chunks = [];
+  for (let i = 0; i < b64.length; i += ARG_CHUNK) chunks.push(b64.slice(i, i + ARG_CHUNK));
+  for (let i = 0; i < chunks.length; i += CHUNKS_PER_CALL) {
+    const first = i === 0;
+    const r = await exec("sh", ["-c",
+      `d="$1"; shift; ${first ? 'mkdir -p "$(dirname "$d")" && ' : ""}for c in "$@"; do printf %s "$c"; done | base64 -d ${first ? ">" : ">>"} "$d.part"`,
+      "put", dest, ...chunks.slice(i, i + CHUNKS_PER_CALL)], { on: daemon.machine, timeout: 120000 });
+    if (r.code !== 0) throw new Error((r.stderr || "upload failed").trim().slice(0, 200));
+  }
+  const r = await exec("mv", ["-f", `${dest}.part`, dest], { on: daemon.machine });
+  if (r.code !== 0) throw new Error((r.stderr || "upload failed").trim());
+  return dest;
+}
+
 // Copy, paste, cut and select-all for one text box, for keyboards that send other chords than
 // Ctrl+C/V. On Windows, mac-style setups (AutoHotkey turning ⌘ into Ctrl+Shift for the
 // terminal) send Ctrl+Shift+C/V, and ⌘A/⌘X may arrive as Alt+A/Alt+X; Ctrl+Insert and
 // Shift+Insert are the old copy/paste keys. A text box knows none of them, so the wrapper
 // around it handles them. Plain Ctrl+C/V/X/A still go to the box itself.
-function textKeys(state, readonly = false) {
+// `onNoText(cx)`: what a paste chord does when the clipboard has no text (an image, say).
+function textKeys(state, readonly = false, onNoText = null) {
   return (e, cx) => {
     const m = e.modifiers, key = String(e.key).toLowerCase();
     const value = state.value(), r = state.selected_range();
@@ -127,6 +198,7 @@ function textKeys(state, readonly = false) {
     if ((m.control && m.shift && key === "v") || (m.shift && !m.control && key === "insert")) {
       const text = cx.read_from_clipboard();
       if (text) state.replace(text);
+      else if (onNoText) onNoText(cx);
     } else if ((m.control && m.shift && key === "c") || (m.control && !m.shift && key === "insert")) {
       if (selected) cx.write_to_clipboard(selected);
     } else if (m.alt && !m.control && key === "x") {   // not Ctrl+Shift+X: Herdr's pane.close
@@ -172,6 +244,9 @@ export default class Bots extends View {
     this.chatScroll = ScrollHandle.new(); // keeps the newest turn in view
     this.selecting = new Map();           // item key -> read-only EditorState showing the reply's source
     this.input.on("submit", (_e, cx) => this.send(cx));
+    this.attachments = [];               // { name, path } on this computer, sent with the next message
+    // A paste with no text (a screenshot): save the clipboard image and attach it.
+    this.input.on("paste_other", (_e, cx) => this.pasteImage(cx));
     if (checking()) return;
     cx.spawn(async (cx) => {
       this.daemonList = await daemons();
@@ -236,18 +311,89 @@ export default class Bots extends View {
   }
 
   send(cx) {
-    const text = this.input.value().trim();
+    const typed = this.input.value().trim();
     const bot = this.snap?.bots.find((b) => b.id === this.selected);
-    if (!text || !bot) return;
-    const args = ["ask", bot.name, text];
+    const files = this.attachments;
+    if ((!typed && !files.length) || !bot || this.uploading) return;
     const answering = this.snap.items.find((i) => i.key === this.answering);
-    if (answering) args.push("--item", String(answering.num));
-    this.input.set_value("");
-    this.answering = null;
+    const shown = typed || `(${files.length} attachment${files.length > 1 ? "s" : ""})`;
     // Shown at once; the daemon's own item replaces it after the next read (a few seconds on
     // another machine, where the status file is read every 2 s over hc).
-    this.pending = { bot: bot.id, text, answering: answering ? answering.num : null };
-    this.run(cx, bot.daemon, args);
+    this.pending = { bot: bot.id, text: files.length ? `${shown}\n📎 ${files.map((f) => f.name).join(", ")}` : shown,
+      answering: answering ? answering.num : null };
+    this.input.set_value("");
+    this.answering = null;
+    if (!files.length) {
+      const args = ["ask", bot.name, typed];
+      if (answering) args.push("--item", String(answering.num));
+      this.run(cx, bot.daemon, args);
+      return;
+    }
+    // Attachments go into the bot's folder on its machine first; the message names them.
+    this.uploading = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const stamp = Date.now();
+        const paths = [];
+        for (const [n, f] of files.entries()) {
+          paths.push(await putOnDaemon(bot.daemon, f.path, `${bot.home}/inbox/${stamp}-${n}-${safeName(f.name)}`));
+        }
+        // Housekeeping, best effort: our paste copies are no longer needed, and the bot's inbox
+        // keeps a week (a later turn may look at an image again). Dropped files are the
+        // person's own and stay where they are.
+        for (const f of files.filter((f) => f.pasted)) {
+          exec(appWindow()?.platform === "windows" ? "powershell" : "rm",
+            appWindow()?.platform === "windows"
+              ? ["-NoProfile", "-NonInteractive", "-Command", `Remove-Item -LiteralPath '${f.path.replace(/'/g, "''")}' -ErrorAction SilentlyContinue`]
+              : ["-f", f.path]).catch(() => {});
+        }
+        exec("find", [`${bot.home}/inbox`, "-type", "f", "-mtime", `+${INBOX_DAYS}`, "-delete"], { on: bot.daemon.machine }).catch(() => {});
+        const text = `${typed || "See the attached file(s)."}\n\n` +
+          paths.map((p) => `[attached file: ${p}] (open it to see it)`).join("\n");
+        const args = ["ask", bot.name, text];
+        if (answering) args.push("--item", String(answering.num));
+        this.attachments = [];
+        this.uploading = false;
+        this.run(cx, bot.daemon, args);
+      } catch (e) {
+        this.uploading = false;
+        this.pending = null;
+        this.input.set_value(typed);
+        this.error = `Attachment not sent: ${String(e?.message ?? e)}`;
+        cx.notify();
+      }
+    });
+  }
+
+  // `pasted`: the file is our own copy of a pasted image, deleted once it is uploaded.
+  attach(cx, paths, pasted = false) {
+    for (const path of paths) {
+      if (!this.attachments.some((a) => a.path === path)) this.attachments.push({ name: baseName(path), path, pasted });
+    }
+    this.error = null;
+    cx.notify();
+  }
+
+  dropped(cx, event) {
+    const paths = event?.paths ?? [];
+    if (!this.selected) { this.error = "Pick a bot first, then drop the files on its chat."; cx.notify(); return; }
+    if (!paths.length) { this.error = "Nothing came with that drop (only files can be attached)."; cx.notify(); return; }
+    this.attach(cx, paths);
+    cx.stop_propagation();
+  }
+
+  pasteImage(cx) {
+    // One ⌘V can arrive twice (the paste chord and the box's own paste_other): one image is enough.
+    const now = Date.now();
+    if (now - (this.lastPasteAt ?? 0) < 1000) return;
+    this.lastPasteAt = now;
+    cx.spawn(async (cx) => {
+      const dest = `${appHome()}/data/bots-paste/paste-${Date.now()}.png`;
+      const why = await saveClipboardImage(dest);
+      if (why) { this.error = `Paste: ${why}`; cx.notify(); return; }
+      this.attach(cx, [dest], true);
+    });
   }
 
   // Runs a herdr-bots command on that daemon, then rereads at once so the change shows.
@@ -360,7 +506,8 @@ export default class Bots extends View {
       if (want !== this.selected) { this.selected = want; this.answering = null; this.error = null; }
     }
     const bot = this.snap?.bots.find((b) => b.id === this.selected);
-    const root = v_flex().id("bots-chat").size_full().bg(this.inPanel ? t.chrome : t.popover).text_color(t.foreground).text_size(12.5);
+    const root = v_flex().id("bots-chat").size_full().bg(this.inPanel ? t.chrome : t.popover).text_color(t.foreground).text_size(12.5)
+      .on_drop((event, cx) => this.dropped(cx, event));
     // In the panel, ‹ goes back to the bot list (where + New bot is); in a window there's no list.
     const header = h_flex().h(40).px(12).gap(6).flex_none().items_center().border_b_1().border_color(t.border)
       .when(this.inPanel && Boolean(this.selected), (el) => el.child(this.button(t, "chat-back", "‹ Bots", () => setShared("bots.chat", null))))
@@ -418,7 +565,11 @@ export default class Bots extends View {
     const last = items.at(-1);
     const sig = `${this.selected}|${items.length}|${last?.status}|${last?.updated_at}|${pending ? 1 : 0}`;
     if (sig !== this.scrollSig) { this.scrollSig = sig; this.chatScroll.scroll_to_item(turns.length - 1); }
+    // A rendered reply copies its selection only on Ctrl+C: the window's own Copy, which a mod
+    // cannot dispatch (window.dispatch_action reaches only actions a mod registered). Other copy
+    // chords use the Copy / Select links under the reply.
     return v_flex().id("bots-conversation").flex_1().min_h(0).overflow_y_scrollbar().track_scroll(this.chatScroll)
+      .on_drop((event, cx) => this.dropped(cx, event))
       .px(12).pt(12).pb(4).gap(16).children(turns).child(this.renderWorkers(t));
   }
 
@@ -452,13 +603,27 @@ export default class Bots extends View {
     return v_flex().id(`turn-${i.key}`).flex_shrink_0().gap(6).children(rows);
   }
 
-  // Mine: right-aligned, tinted. `note` goes under it (time, "answer", "sending…").
+  // Mine: right-aligned, tinted. Under it: `note` (time, "answer", "sending…") and, once sent,
+  // a Copy link for the whole message.
   userBubble(t, id, text, note, faded = false) {
     return v_flex().id(id).flex_shrink_0().w_full().items_end().gap(2)
       .child(h_flex().w_full().justify_end().pl(40)
         .child(div().min_w(0).px(11).py(7).rounded(12).bg(t.accent + "30").text_size(12.5)
           .text_color(faded ? t.muted : t.foreground).whitespace_normal().child(text)))
-      .when(Boolean(note), (el) => el.child(div().pr(4).text_size(10.5).text_color(t.dim).child(note)));
+      .child(h_flex().pr(4).gap(8).text_size(10.5).text_color(t.dim)
+        .when(!faded, (el) => el.child(this.copyLink(t, `copy-${id}`, text, "Copy the message")))
+        .when(Boolean(note), (el) => el.child(div().child(note))));
+  }
+
+  // "Copy" that turns into "Copied" for a moment.
+  copyLink(t, id, text, tip) {
+    return div().id(id).flex_none().text_color(t.dim).cursor_pointer()
+      .hover((s) => s.text_color(t.foreground)).tooltip(tip)
+      .on_click((_e, cx) => {
+        cx.write_to_clipboard(text); this.copied = id; cx.notify();
+        cx.timer.after(1500, (cx) => { if (this.copied === id) { this.copied = null; cx.notify(); } });
+      })
+      .child(this.copied === id ? "Copied" : "Copy");
   }
 
   // The bot's: left-aligned on the raised surface, any element inside (markdown, typing dots).
@@ -501,11 +666,7 @@ export default class Bots extends View {
       .child(div().text_color(t.dim).child(`${i.botName} · #${i.num} · ${hhmm(i.updated_at)}`))
       .child(div().text_color(color).child(state))
       // The whole reply as markdown source, for keyboards whose copy chord a text view ignores.
-      .when(Boolean(reply), (el) => el.child(div().id(`copy-${i.key}`).flex_none().text_color(t.dim).cursor_pointer()
-        .hover((s) => s.text_color(t.foreground)).tooltip("Copy the reply (markdown)")
-        .on_click((_e, cx) => { cx.write_to_clipboard(reply); this.copied = i.key; cx.notify();
-          cx.timer.after(1500, (cx) => { if (this.copied === i.key) { this.copied = null; cx.notify(); } }); })
-        .child(this.copied === i.key ? "Copied" : "Copy")))
+      .when(Boolean(reply), (el) => el.child(this.copyLink(t, `copy-${i.key}`, reply, "Copy the reply (markdown)")))
       .when(Boolean(reply), (el) => el.child(div().id(`select-${i.key}`).flex_none().text_color(t.dim).cursor_pointer()
         .hover((s) => s.text_color(t.foreground))
         .tooltip(this.selecting.has(i.key) ? "Back to the rendered reply" : "Show the source, to select a part and copy it")
@@ -858,11 +1019,19 @@ export default class Bots extends View {
     const answering = this.snap?.items.find((i) => i.key === this.answering);
     const bot = this.snap?.bots.find((b) => b.id === this.selected);
     const label = answering ? `Reply to ${answering.botName}'s question (#${answering.num})` : bot ? `Message ${this.label(bot)}` : "No bot selected";
-    return h_flex().p(8).gap(6).flex_none().border_t_1().border_color(t.border).items_end()
+    return h_flex().id("bots-input-row").p(8).gap(6).flex_none().border_t_1().border_color(t.border).items_end()
+      .on_drop((event, cx) => this.dropped(cx, event))
       .when(Boolean(this.answering), (el) => el.child(this.button(t, "unanswer", "×", (cx) => { this.answering = null; cx.notify(); })))
       .child(v_flex().flex_1().gap(2)
-        .child(div().text_size(10.5).text_color(t.dim).child(label))
-        .child(div().on_key_down(textKeys(this.input))
+        .when(this.attachments.length > 0, (el) => el.child(h_flex().flex_wrap().gap(4).pb(2)
+          .children(this.attachments.map((a, n) => h_flex().id(`att-${n}`).gap(4).items_center().px(6).py(2).rounded(6)
+            .bg(t.raised).text_size(11)
+            .child(div().max_w(180).truncate().tooltip(a.path).child(`📎 ${a.name}`))
+            .child(div().id(`att-x-${n}`).text_color(t.dim).cursor_pointer().hover((s) => s.text_color(t.foreground))
+              .on_click((_e, cx) => { this.attachments.splice(n, 1); cx.notify(); }).child("×"))))))
+        .child(div().text_size(10.5).text_color(t.dim)
+          .child(this.uploading ? "Uploading attachments…" : this.attachments.length ? `${label} · drop or paste more files` : label))
+        .child(div().on_key_down(textKeys(this.input, false, (cx) => this.pasteImage(cx)))
           .child(Input.new(this.input).h(32).px(8).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.5))))
       .child(this.button(t, "send", "Send", (cx) => this.send(cx), true));
   }

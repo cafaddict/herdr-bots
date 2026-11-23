@@ -148,6 +148,15 @@ To rename a bot, hover it in the sidebar and click **Rename**, click its name in
 ends, so the next turn starts a new session; `SOUL.md` and `MEMORY.md` stay. It refuses while the
 bot is on a turn or has running workers.
 
+To give a bot an image or a file, drop it on the chat or paste an image into the message box
+(⌘V / Ctrl+Shift+V). The panel copies it into the bot's `inbox/` on the bot's machine, and the
+message names its path. A pasted image is a temporary copy under the app's `data/bots-paste/`,
+deleted after the upload. Dropped files stay where they are. Files in `inbox/` older than 7 days
+are deleted the next time something is attached.
+
+**Copy** on a message (yours or the bot's) copies its text; **Select** shows it as text you can
+select part of.
+
 The daemon reloads a bot within 5 seconds after you save its `bot.toml`. A broken `bot.toml`
 shows up as an error in the panel and in `herdr-bots status` instead of stopping the daemon.
 
