@@ -336,3 +336,49 @@ fn rm_cancels_items_and_moves_the_bot_to_trash() {
     // The same name can be used again.
     d.cli(&["new", "gone"]).unwrap();
 }
+
+#[test]
+fn rename_moves_the_folder_and_its_items() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = Daemon::start(tmp.path());
+    d.cli(&["new", "old"]).unwrap();
+    d.cli(&["new", "taken"]).unwrap();
+    d.until("bots loaded", || {
+        d.status()["bots"].as_array().unwrap().len() == 2
+    });
+    d.cli(&["pause", "old"]).unwrap();
+    let filed: Value = serde_json::from_str(&d.cli(&["ask", "old", "later"]).unwrap()).unwrap();
+    let id = filed["id"].as_i64().unwrap();
+    std::fs::write(d.root.join("bots/old/MEMORY.md"), "- keep me\n").unwrap();
+
+    assert!(d.cli(&["rename", "old", "taken"]).is_err(), "name in use");
+    assert!(d.cli(&["rename", "old", "../etc"]).is_err(), "not a bot id");
+    assert!(d.cli(&["rename", "nobody", "x"]).is_err(), "no such bot");
+
+    let out: Value = serde_json::from_str(&d.cli(&["rename", "old", "new"]).unwrap()).unwrap();
+    assert_eq!(out["to"], "new");
+    assert!(!d.root.join("bots/old").exists());
+    assert_eq!(
+        std::fs::read_to_string(d.root.join("bots/new/MEMORY.md")).unwrap(),
+        "- keep me\n"
+    );
+    assert_eq!(d.item(id)["bot"], "new", "its item follows");
+    d.until("renamed bot loaded", || {
+        let ids: Vec<String> = d.status()["bots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.contains(&"new".to_string()) && !ids.contains(&"old".to_string())
+    });
+    // Paused stays paused under the new name.
+    let bot = d.status()["bots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["id"] == "new")
+        .cloned()
+        .unwrap();
+    assert_eq!(bot["paused"], true);
+}
