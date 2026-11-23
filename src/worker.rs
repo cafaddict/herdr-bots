@@ -73,10 +73,52 @@ pub async fn start(app: &Arc<App>, req: StartRequest) -> anyhow::Result<Worker> 
     let app = Arc::clone(app);
     let w = worker.clone();
     tokio::spawn(async move {
-        let end = run(&app, &w, &argv, &spec).await;
+        let mut end = run(&app, &w, &argv, &spec).await;
+        // An hc hiccup mid-turn isn't the worker's end: if its terminal still runs, keep
+        // watching it instead of reporting (and cleaning up) a worker that's still working.
+        if end.is_err() && terminal_alive(&app, &w.name).await {
+            end = watch(&app, &w.name).await;
+        }
         report_back(&app, &w, end).await;
     });
     Ok(worker)
+}
+
+/// How many times `watch` retries a failing `hc wait` (10 s apart) before giving up.
+const WATCH_RETRIES: u32 = 30;
+
+/// Waits out a running worker's turn. Retries hc errors (the core restarting, a daemon that
+/// came up before hc did) instead of treating them as the worker's end.
+async fn watch(app: &App, name: &str) -> anyhow::Result<TurnEnd> {
+    let mut failures = 0;
+    loop {
+        let outcome = match app.hc.wait(name, 300).await {
+            Ok(o) => o,
+            Err(e) if e.is_not_found() => return Ok(TurnEnd::Exited(None)),
+            Err(e) => {
+                failures += 1;
+                if failures > WATCH_RETRIES {
+                    return Err(e.into());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+        failures = 0;
+        if outcome.is_checkin() || outcome.status == Some(crate::hc::AgentStatus::Working) {
+            continue;
+        }
+        return Ok(match (outcome.reason.as_deref(), outcome.status) {
+            (Some("exit"), _) => TurnEnd::Exited(outcome.exit_code),
+            (_, Some(crate::hc::AgentStatus::Blocked)) => TurnEnd::Blocked,
+            (_, Some(crate::hc::AgentStatus::Error)) => TurnEnd::Failed,
+            _ => TurnEnd::Finished,
+        });
+    }
+}
+
+async fn terminal_alive(app: &App, name: &str) -> bool {
+    matches!(app.hc.get(name).await, Ok(Some(t)) if t.is_live())
 }
 
 async fn run(app: &App, w: &Worker, argv: &[String], spec: &str) -> anyhow::Result<TurnEnd> {
@@ -97,22 +139,7 @@ pub fn resume_running(app: &Arc<App>) {
     for w in running {
         let app = Arc::clone(app);
         tokio::spawn(async move {
-            let end = async {
-                loop {
-                    let outcome = app.hc.wait(&w.name, 300).await?;
-                    if outcome.is_checkin()
-                        || outcome.status == Some(crate::hc::AgentStatus::Working)
-                    {
-                        continue;
-                    }
-                    return Ok(match (outcome.reason.as_deref(), outcome.status) {
-                        (Some("exit"), _) => TurnEnd::Exited(outcome.exit_code),
-                        (_, Some(crate::hc::AgentStatus::Blocked)) => TurnEnd::Blocked,
-                        _ => TurnEnd::Finished,
-                    });
-                }
-            }
-            .await;
+            let end = watch(&app, &w.name).await;
             report_back(&app, &w, end).await;
         });
     }
@@ -129,16 +156,19 @@ async fn report_back(app: &App, w: &Worker, end: anyhow::Result<TurnEnd>) {
         Ok(TurnEnd::Failed) => ("failed", "reported an error"),
         Err(e) => {
             warn!(worker = w.name, "worker failed: {e:#}");
-            ("failed", "could not run")
+            (
+                "failed",
+                "could not be followed (its terminal and worktree were left as they are)",
+            )
         }
     };
     if status == "failed" && end.is_ok() {
         warn!(worker = w.name, "worker {note}");
     }
-    // A blocked worker keeps its terminal: the owner may answer the dialog there.
-    let cleanup = match &end {
-        Ok(TurnEnd::Blocked) => None,
-        _ => Some(clean_up(app, w).await),
+    let cleanup = if should_clean_up(&end) {
+        Some(clean_up(app, w).await)
+    } else {
+        None
     };
     let finished = {
         let store = app.store();
@@ -183,6 +213,16 @@ async fn report_back(app: &App, w: &Worker, end: anyhow::Result<TurnEnd>) {
             note: Some(text),
         },
     );
+}
+
+/// Only a worker whose turn really ended gets its terminal ended and worktree removed. A
+/// blocked one keeps both (the owner may answer its dialog there); after an error we don't
+/// know whether it still works in that folder, so nothing is touched.
+fn should_clean_up(end: &anyhow::Result<TurnEnd>) -> bool {
+    matches!(
+        end,
+        Ok(TurnEnd::Finished | TurnEnd::Exited(_) | TurnEnd::Failed)
+    )
 }
 
 /// Ends a finished worker's terminal, then removes its worktree if it is clean.
@@ -283,6 +323,15 @@ async fn git(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_real_end_cleans_up() {
+        assert!(should_clean_up(&Ok(TurnEnd::Finished)));
+        assert!(should_clean_up(&Ok(TurnEnd::Exited(Some(0)))));
+        assert!(should_clean_up(&Ok(TurnEnd::Failed)));
+        assert!(!should_clean_up(&Ok(TurnEnd::Blocked)));
+        assert!(!should_clean_up(&Err(anyhow::anyhow!("hc unreachable"))));
+    }
 
     #[test]
     fn message_has_branch_and_report_command() {

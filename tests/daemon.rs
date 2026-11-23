@@ -382,3 +382,33 @@ fn rename_moves_the_folder_and_its_items() {
         .unwrap();
     assert_eq!(bot["paused"], true);
 }
+
+#[test]
+fn rename_keeps_pause_and_does_not_inherit_a_deleted_bot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = Daemon::start(tmp.path());
+    for id in ["old", "keep"] {
+        d.cli(&["new", id]).unwrap();
+    }
+    d.until("bots loaded", || {
+        d.status()["bots"].as_array().unwrap().len() == 2
+    });
+    // `old` is paused and deleted; `keep` is renamed to `old` and must not come back paused.
+    d.cli(&["pause", "old"]).unwrap();
+    d.cli(&["rm", "old"]).unwrap();
+    d.cli(&["rename", "keep", "old"]).unwrap();
+    d.until("renamed", || d.status()["bots"][0]["id"] == "old");
+    assert_eq!(d.status()["bots"][0]["paused"], false);
+    // A paused bot stays paused through a rename, and its queued item moves with it.
+    d.cli(&["pause", "old"]).unwrap();
+    let filed: Value = serde_json::from_str(&d.cli(&["ask", "old", "hi"]).unwrap()).unwrap();
+    let id = filed["id"].as_i64().unwrap();
+    d.cli(&["rename", "old", "newer"]).unwrap();
+    d.until("renamed again", || d.status()["bots"][0]["id"] == "newer");
+    assert_eq!(d.status()["bots"][0]["paused"], true);
+    assert_eq!(d.item(id)["bot"], "newer");
+    assert_eq!(d.item(id)["status"], "planned");
+    // Resumed under the new name, the item runs.
+    d.cli(&["resume", "newer"]).unwrap();
+    d.until("item done", || d.item(id)["status"] == "done");
+}

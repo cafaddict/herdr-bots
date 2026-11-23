@@ -254,46 +254,74 @@ async fn rename_bot(app: &Arc<App>, bot: &str, to: &str) -> anyhow::Result<Value
     let dest = app.paths.bot_home(to);
     anyhow::ensure!(home.is_dir(), "no bot `{bot}`");
     anyhow::ensure!(!dest.exists(), "a bot `{to}` already exists");
-    {
-        let store = app.store();
-        let running: Vec<String> = store
-            .workers(true, 1000)?
-            .into_iter()
-            .filter(|w| w.bot == bot)
-            .map(|w| w.name)
-            .collect();
-        anyhow::ensure!(
-            running.is_empty(),
-            "{bot} has running workers ({}); rename it after they finish",
-            running.join(", ")
-        );
-        let busy = store
-            .items_with_status(Status::Working)?
-            .into_iter()
-            .any(|i| i.bot == bot);
-        anyhow::ensure!(
-            !busy,
-            "{bot} is on a turn; rename it after the turn ends (or pause it first)"
-        );
+    // Hold the bot first, then check: `run_turn` reads the pause under the store lock before it
+    // starts a turn, so from here no new turn begins, and the check can't go stale under us.
+    let was_paused = app.store().paused(bot)?;
+    app.store().set_paused(bot, true)?;
+    app.remove_actor(bot);
+    if let Err(e) = rename_blockers(app, bot) {
+        undo_hold(app, bot, was_paused);
+        return Err(e);
     }
 
-    // No new turns for the old name, and end its session: the terminal is named after the bot.
-    app.remove_actor(bot);
+    // End its session: the terminal is named after the bot.
     let _ = app.hc.kill(&terminal_name(bot)).await;
     let _ = app.hc.rm(&terminal_name(bot)).await;
 
     // The folder first (one rename), then the rows; if the rows fail, the folder goes back.
-    std::fs::rename(&home, &dest)
-        .with_context(|| format!("move {} to {}", home.display(), dest.display()))?;
-    if let Err(e) = app.store().rename_bot(bot, to) {
+    if let Err(e) = std::fs::rename(&home, &dest) {
+        undo_hold(app, bot, was_paused);
+        return Err(anyhow::Error::new(e).context(format!(
+            "move {} to {}",
+            home.display(),
+            dest.display()
+        )));
+    }
+    if let Err(e) = app.store().rename_bot(bot, to, &stamp()) {
         let _ = std::fs::rename(&dest, &home);
+        undo_hold(app, bot, was_paused);
         reload(app);
         return Err(e.into());
     }
+    app.store().set_paused(to, was_paused)?;
     info!(bot, to, "bot renamed");
     reload(app);
     runner::requeue_planned(app, to);
     Ok(json!({ "renamed": bot, "to": to, "home": dest }))
+}
+
+/// Why `bot` can't be renamed right now: workers running, or a turn under way.
+fn rename_blockers(app: &App, bot: &str) -> anyhow::Result<()> {
+    let store = app.store();
+    let running: Vec<String> = store
+        .workers(true, 1000)?
+        .into_iter()
+        .filter(|w| w.bot == bot)
+        .map(|w| w.name)
+        .collect();
+    anyhow::ensure!(
+        running.is_empty(),
+        "{bot} has running workers ({}); rename it after they finish",
+        running.join(", ")
+    );
+    let busy = store
+        .items_with_status(Status::Working)?
+        .into_iter()
+        .any(|i| i.bot == bot);
+    anyhow::ensure!(!busy, "{bot} is on a turn; rename it after the turn ends");
+    Ok(())
+}
+
+/// Gives a bot back its queue after a rename that didn't happen.
+fn undo_hold(app: &Arc<App>, bot: &str, was_paused: bool) {
+    if !was_paused {
+        let _ = app.store().set_paused(bot, false);
+    }
+    runner::ensure_actor(app, bot);
+}
+
+fn stamp() -> String {
+    chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
 }
 
 async fn remove_bot(app: &Arc<App>, bot: &str, force: bool) -> anyhow::Result<Value> {
@@ -341,12 +369,12 @@ async fn remove_bot(app: &Arc<App>, bot: &str, force: bool) -> anyhow::Result<Va
     // Kept, not deleted: SOUL.md and MEMORY.md are the bot's history.
     let trash = app.paths.root().join("trash");
     std::fs::create_dir_all(&trash)?;
-    let dest = trash.join(format!(
-        "{bot}-{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    ));
+    let tag = stamp();
+    let dest = trash.join(format!("{bot}-{tag}"));
     std::fs::rename(&home, &dest)
         .with_context(|| format!("move {} to {}", home.display(), dest.display()))?;
+    // Free the name: a new bot called `bot` starts without this one's pause, seen triggers or items.
+    app.store().retire_bot(bot, &tag)?;
     info!(bot, trash = %dest.display(), canceled, "bot removed");
     reload(app);
     Ok(

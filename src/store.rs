@@ -196,6 +196,23 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     })
 }
 
+fn retire(tx: &rusqlite::Transaction<'_>, bot: &str, tag: &str) -> Result<(), StoreError> {
+    let archived = format!("{bot}~{tag}");
+    for table in ["items", "workers"] {
+        tx.execute(
+            &format!("UPDATE {table} SET bot = ?2 WHERE bot = ?1"),
+            params![bot, archived],
+        )?;
+    }
+    tx.execute("DELETE FROM bot_state WHERE bot = ?1", [bot])?;
+    tx.execute("DELETE FROM seen WHERE bot = ?1", [bot])?;
+    tx.execute(
+        "DELETE FROM cursors WHERE substr(key, 1, length('baseline:' || ?1 || ':')) = 'baseline:' || ?1 || ':'",
+        [bot],
+    )?;
+    Ok(())
+}
+
 fn row_to_worker(row: &rusqlite::Row<'_>) -> rusqlite::Result<Worker> {
     Ok(Worker {
         name: row.get(0)?,
@@ -450,8 +467,11 @@ impl Store {
 
     /// Moves everything the store keeps under one bot id to another: items, workers, pause
     /// state, seen trigger keys and trigger baselines. One transaction: all of it or none.
-    pub fn rename_bot(&self, from: &str, to: &str) -> Result<(), StoreError> {
+    /// Whatever a deleted bot of the target name left behind is retired first, so the renamed
+    /// bot neither collides with it nor inherits it.
+    pub fn rename_bot(&self, from: &str, to: &str, tag: &str) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
+        retire(&tx, to, tag)?;
         for table in ["items", "workers", "bot_state", "seen"] {
             tx.execute(
                 &format!("UPDATE {table} SET bot = ?2 WHERE bot = ?1"),
@@ -464,6 +484,15 @@ impl Store {
              WHERE substr(key, 1, length('baseline:' || ?1 || ':')) = 'baseline:' || ?1 || ':'",
             params![from, to],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Frees a deleted bot's id: its pause state, seen trigger keys and baselines go, and its
+    /// history (items, workers) is relabeled `<bot>~<tag>`. A new bot of that name starts clean.
+    pub fn retire_bot(&self, bot: &str, tag: &str) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        retire(&tx, bot, tag)?;
         tx.commit()?;
         Ok(())
     }
@@ -572,6 +601,59 @@ mod tests {
         s.ask(b, "?").unwrap();
         let ids: Vec<i64> = s.recent_items(10).unwrap().iter().map(|i| i.id).collect();
         assert_eq!(ids, vec![b, a]);
+    }
+
+    #[test]
+    fn a_deleted_bots_name_is_free_for_a_rename() {
+        let s = Store::open_in_memory().unwrap();
+        let trig = |bot: &'static str| NewItem {
+            bot,
+            source: "github",
+            external_id: Some("o/r#1"),
+            title: "t",
+            body: "b",
+            url: None,
+        };
+        // `foo` saw a trigger, was paused, then was deleted.
+        let old = s.add_item(&trig("foo")).unwrap().unwrap().id;
+        s.mark_seen("foo", "o/r#1").unwrap();
+        s.set_paused("foo", true).unwrap();
+        s.set_cursor("baseline:foo:github", "x").unwrap();
+        s.retire_bot("foo", "t1").unwrap();
+        // `bar` has the same trigger (same unique key) and is renamed to `foo`.
+        s.add_item(&trig("bar")).unwrap().unwrap();
+        s.rename_bot("bar", "foo", "t2").unwrap();
+        assert!(!s.paused("foo").unwrap(), "no inherited pause");
+        assert!(
+            s.mark_seen("foo", "o/r#1").unwrap(),
+            "no inherited seen keys"
+        );
+        assert!(s.cursor("baseline:foo:github").unwrap().is_none());
+        assert_eq!(
+            s.item(old).unwrap().bot,
+            "foo~t1",
+            "old history kept, relabeled"
+        );
+    }
+
+    #[test]
+    fn rename_over_leftovers_from_before_retire_existed() {
+        // Rows a deleted bot left behind before deletes retired them: rename still succeeds.
+        let s = Store::open_in_memory().unwrap();
+        let new = |bot: &'static str| NewItem {
+            bot,
+            source: "github",
+            external_id: Some("k"),
+            title: "t",
+            body: "b",
+            url: None,
+        };
+        s.add_item(&new("foo")).unwrap();
+        s.set_paused("foo", true).unwrap();
+        s.add_item(&new("bar")).unwrap();
+        s.set_paused("bar", false).unwrap();
+        s.rename_bot("bar", "foo", "t").unwrap();
+        assert!(!s.paused("foo").unwrap());
     }
 
     #[test]

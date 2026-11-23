@@ -81,11 +81,12 @@ pub async fn ensure_agent(
     argv: &[String],
 ) -> Result<Readiness, AgentError> {
     match hc.get(name).await? {
-        Some(t) if t.is_live() => match t.status {
-            // Blocked may be the folder-trust dialog, which settle answers.
-            None | Some(AgentStatus::Blocked) => {}
-            Some(_) => return Ok(Readiness::Ready),
-        },
+        // No status yet means it's still starting, maybe on the trust dialog: settle below.
+        Some(t) if t.is_live() => {
+            if let Some(ready) = live_step(t.status) {
+                return Ok(ready);
+            }
+        }
         Some(_) => {
             hc.rm(name).await?; // a finished one keeps the name until removed
             hc.run_bg(name, cwd, labels, argv).await?;
@@ -95,6 +96,19 @@ pub async fn ensure_agent(
         }
     }
     settle(hc, name).await
+}
+
+/// What a terminal that's already running needs. `None`: it hasn't reported a status yet, so
+/// it's still starting and `settle` may answer its folder-trust dialog.
+///
+/// A session that has reported `blocked` is past startup: it waits on a person (a tool
+/// permission prompt, a question). Never press keys into that, whatever its screen shows.
+fn live_step(status: Option<AgentStatus>) -> Option<Readiness> {
+    match status {
+        None => None,
+        Some(AgentStatus::Blocked) => Some(Readiness::Blocked),
+        Some(_) => Some(Readiness::Ready),
+    }
 }
 
 /// Waits for a starting agent to report a status, getting it past the folder-trust dialog.
@@ -163,12 +177,19 @@ enum Dialog {
     NeedsPerson,
 }
 
+/// How many of the screen's last non-empty lines a first-start dialog fills. Text above them is
+/// whatever scrolled by (a diff, a file) and must not count as the dialog.
+const DIALOG_TAIL: usize = 16;
+
 fn first_start_dialog(screen: &str) -> Option<Dialog> {
+    let tail: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = tail[tail.len().saturating_sub(DIALOG_TAIL)..].join("\n");
+    let screen = tail.as_str();
     if screen.contains("Bypass Permissions mode") || screen.contains("Yes, I accept") {
         return Some(Dialog::NeedsPerson);
     }
-    // Claude Code: "❯ No, exit / Yes, I trust this folder" (older: "Yes, proceed" first).
-    if screen.contains("Yes, I trust this folder") {
+    // Claude Code: "Accessing workspace: ... ❯ No, exit / Yes, I trust this folder".
+    if screen.contains("Accessing workspace") && screen.contains("Yes, I trust this folder") {
         let cursor_on = |option: &str| {
             screen
                 .lines()
@@ -255,12 +276,13 @@ mod tests {
 
     #[test]
     fn trust_keys_follow_the_cursor() {
-        let moved = " ❯ Yes, I trust this folder\n   No, exit";
+        let moved = " Accessing workspace:\n ❯ Yes, I trust this folder\n   No, exit";
         assert_eq!(
             start_step(Some(AgentStatus::Blocked), moved),
             StartStep::Trust(&["enter"])
         );
-        let half_pressed = "   No, exit\n ❯ Yes, I trust this folder\n Enter to confirm";
+        let half_pressed =
+            " Accessing workspace:\n   No, exit\n ❯ Yes, I trust this folder\n Enter to confirm";
         assert_eq!(
             start_step(Some(AgentStatus::Blocked), half_pressed),
             StartStep::Trust(&["enter"])
@@ -284,6 +306,46 @@ mod tests {
         assert_eq!(
             start_step(Some(AgentStatus::Working), "starting"),
             StartStep::Wait
+        );
+    }
+
+    #[test]
+    fn a_running_blocked_session_is_never_answered() {
+        // A tool-permission prompt in a session that already reported a status: whatever its
+        // screen shows, it goes to the person.
+        assert_eq!(
+            live_step(Some(AgentStatus::Blocked)),
+            Some(Readiness::Blocked)
+        );
+        assert_eq!(live_step(Some(AgentStatus::Idle)), Some(Readiness::Ready));
+        assert_eq!(
+            live_step(Some(AgentStatus::Working)),
+            Some(Readiness::Ready)
+        );
+        assert_eq!(live_step(None), None);
+    }
+
+    #[test]
+    fn trust_text_in_scrolled_output_is_not_the_dialog() {
+        // This repo's own test strings in a diff above a permission prompt.
+        let mut screen = String::from(
+            " Accessing workspace:\n ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm\n",
+        );
+        for n in 0..20 {
+            screen.push_str(&format!("  {n} +    let other = line_{n}();\n"));
+        }
+        screen.push_str(
+            " Do you want to make this edit to agent.rs?\n ❯ 1. Yes\n   2. Yes, and don't ask again\n   3. No\n",
+        );
+        assert_eq!(first_start_dialog(&screen), None);
+        assert_eq!(
+            start_step(Some(AgentStatus::Blocked), &screen),
+            StartStep::Blocked
+        );
+        // Without the dialog's header the options alone don't count either.
+        assert_eq!(
+            first_start_dialog(" ❯ No, exit\n   Yes, I trust this folder"),
+            None
         );
     }
 

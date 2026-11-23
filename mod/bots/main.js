@@ -127,17 +127,21 @@ const INBOX_DAYS = 7;                 // files in a bot's inbox/ older than this
 const baseName = (path) => String(path).split(/[\\/]/).pop() || "file";
 const safeName = (name) => name.replace(/[^A-Za-z0-9._-]+/g, "_").slice(-80) || "file";
 
+// A PowerShell single-quoted string. PowerShell treats the curly quotes U+2018-U+201B as single
+// quotes too, so every one of them is doubled, not just ' (as its own escaping does).
+const psQuote = (text) => `'${String(text).replace(/['\u2018\u2019\u201A\u201B]/g, (q) => q + q)}'`;
+
 // Saves the clipboard's image as a PNG at `dest` on this computer. Null on success, else why.
 async function saveClipboardImage(dest) {
   const platform = appWindow()?.platform;
   let r;
   if (platform === "windows") {
-    const q = dest.replace(/'/g, "''");
+    const q = psQuote(dest);
     r = await exec("powershell", ["-NoProfile", "-NonInteractive", "-Command",
       "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; " +
       "$img=[System.Windows.Forms.Clipboard]::GetImage(); if ($img -eq $null) { exit 3 }; " +
-      `New-Item -ItemType Directory -Force -Path (Split-Path -Parent '${q}') | Out-Null; ` +
-      `$img.Save('${q}', [System.Drawing.Imaging.ImageFormat]::Png)`]).catch((e) => ({ code: 1, stderr: String(e) }));
+      `New-Item -ItemType Directory -Force -Path (Split-Path -Parent ${q}) | Out-Null; ` +
+      `$img.Save(${q}, [System.Drawing.Imaging.ImageFormat]::Png)`]).catch((e) => ({ code: 1, stderr: String(e) }));
   } else if (platform === "macos") {
     r = await exec("sh", ["-c", 'mkdir -p "$(dirname "$1")" && osascript -e "set f to (open for access POSIX file \\"$1\\" with write permission)" -e "write (the clipboard as «class PNGf») to f" -e "close access f"', "paste", dest])
       .catch((e) => ({ code: 1, stderr: String(e) }));
@@ -154,7 +158,7 @@ async function readBase64(path) {
   const platform = appWindow()?.platform;
   const r = platform === "windows"
     ? await exec("powershell", ["-NoProfile", "-NonInteractive", "-Command",
-      `[Convert]::ToBase64String([IO.File]::ReadAllBytes('${path.replace(/'/g, "''")}'))`])
+      `[Convert]::ToBase64String([IO.File]::ReadAllBytes(${psQuote(path)}))`])
     : await exec("base64", platform === "macos" ? ["-i", path] : ["-w0", path]);
   if (r.code !== 0) throw new Error((r.stderr || `exit ${r.code}`).trim().slice(0, 200));
   return r.stdout.replace(/\s+/g, "");
@@ -270,8 +274,22 @@ export default class Bots extends View {
     if (this.mode === "chat") cx.timer.after(300, () => this.input.focus());
   }
 
+  // One read at a time: a slow or unreachable machine would otherwise pile reads up on every
+  // tick, and a late, older answer could overwrite a newer one. A change that lands while a
+  // read is out gets one more read right after it.
   reload(cx) {
-    cx.spawn(async (cx) => { if (await this.load()) cx.notify(); });
+    if (this.loading) { this.reloadAgain = true; return; }
+    this.loading = true;
+    cx.spawn(async (cx) => {
+      try {
+        do {
+          this.reloadAgain = false;
+          if (await this.load()) cx.notify();
+        } while (this.reloadAgain);
+      } finally {
+        this.loading = false;
+      }
+    });
   }
 
   // Reads every daemon's status. True when something changed and the view should redraw.
@@ -345,7 +363,7 @@ export default class Bots extends View {
         for (const f of files.filter((f) => f.pasted)) {
           exec(appWindow()?.platform === "windows" ? "powershell" : "rm",
             appWindow()?.platform === "windows"
-              ? ["-NoProfile", "-NonInteractive", "-Command", `Remove-Item -LiteralPath '${f.path.replace(/'/g, "''")}' -ErrorAction SilentlyContinue`]
+              ? ["-NoProfile", "-NonInteractive", "-Command", `Remove-Item -LiteralPath ${psQuote(f.path)} -ErrorAction SilentlyContinue`]
               : ["-f", f.path]).catch(() => {});
         }
         exec("find", [`${bot.home}/inbox`, "-type", "f", "-mtime", `+${INBOX_DAYS}`, "-delete"], { on: bot.daemon.machine }).catch(() => {});
