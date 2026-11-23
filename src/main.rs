@@ -93,6 +93,12 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Rename a bot: its folder, items, workers and trigger state follow. Its terminal ends; the
+    /// next turn starts a new session (MEMORY.md stays).
+    Rename {
+        bot: String,
+        to: String,
+    },
     /// Register the daemon with launchd (macOS) or systemd --user (Linux) and start it.
     InstallService,
     UninstallService,
@@ -212,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
                     Request::WorkerDone { name, pr, summary }
                 }
                 Command::Rm { bot, force } => Request::Remove { bot, force },
+                Command::Rename { bot, to } => Request::Rename { bot, to },
                 _ => unreachable!("handled above"),
             };
             let data = ipc::call(&paths.socket(), &req).await?;

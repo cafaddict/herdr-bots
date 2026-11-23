@@ -448,6 +448,26 @@ impl Store {
         Ok(n == 1)
     }
 
+    /// Moves everything the store keeps under one bot id to another: items, workers, pause
+    /// state, seen trigger keys and trigger baselines. One transaction: all of it or none.
+    pub fn rename_bot(&self, from: &str, to: &str) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for table in ["items", "workers", "bot_state", "seen"] {
+            tx.execute(
+                &format!("UPDATE {table} SET bot = ?2 WHERE bot = ?1"),
+                params![from, to],
+            )?;
+        }
+        // Trigger baselines are keyed "baseline:<bot>:<source>".
+        tx.execute(
+            "UPDATE cursors SET key = 'baseline:' || ?2 || substr(key, length('baseline:' || ?1) + 1)
+             WHERE substr(key, 1, length('baseline:' || ?1 || ':')) = 'baseline:' || ?1 || ':'",
+            params![from, to],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn cursor(&self, key: &str) -> Result<Option<String>, StoreError> {
         Ok(self
             .conn

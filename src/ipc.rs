@@ -63,6 +63,13 @@ pub enum Request {
         #[serde(default)]
         force: bool,
     },
+    /// Renames a bot: its folder, its items, workers and trigger state. Ends its terminal (the
+    /// next turn starts a new session under the new name). Refuses while it is on a turn or
+    /// its workers run.
+    Rename {
+        bot: String,
+        to: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -232,7 +239,61 @@ async fn handle(app: &Arc<App>, req: Request) -> anyhow::Result<Value> {
             Ok(serde_json::to_value(w)?)
         }
         Request::Remove { bot, force } => remove_bot(app, &bot, force).await,
+        Request::Rename { bot, to } => rename_bot(app, &bot, &to).await,
     }
+}
+
+async fn rename_bot(app: &Arc<App>, bot: &str, to: &str) -> anyhow::Result<Value> {
+    anyhow::ensure!(config::valid_bot_id(bot), "no bot `{bot}`");
+    anyhow::ensure!(
+        config::valid_bot_id(to),
+        "`{to}` is not a valid bot id (1-24 of a-z 0-9 - _)"
+    );
+    anyhow::ensure!(bot != to, "{bot} already has that name");
+    let home = app.paths.bot_home(bot);
+    let dest = app.paths.bot_home(to);
+    anyhow::ensure!(home.is_dir(), "no bot `{bot}`");
+    anyhow::ensure!(!dest.exists(), "a bot `{to}` already exists");
+    {
+        let store = app.store();
+        let running: Vec<String> = store
+            .workers(true, 1000)?
+            .into_iter()
+            .filter(|w| w.bot == bot)
+            .map(|w| w.name)
+            .collect();
+        anyhow::ensure!(
+            running.is_empty(),
+            "{bot} has running workers ({}); rename it after they finish",
+            running.join(", ")
+        );
+        let busy = store
+            .items_with_status(Status::Working)?
+            .into_iter()
+            .any(|i| i.bot == bot);
+        anyhow::ensure!(
+            !busy,
+            "{bot} is on a turn; rename it after the turn ends (or pause it first)"
+        );
+    }
+
+    // No new turns for the old name, and end its session: the terminal is named after the bot.
+    app.remove_actor(bot);
+    let _ = app.hc.kill(&terminal_name(bot)).await;
+    let _ = app.hc.rm(&terminal_name(bot)).await;
+
+    // The folder first (one rename), then the rows; if the rows fail, the folder goes back.
+    std::fs::rename(&home, &dest)
+        .with_context(|| format!("move {} to {}", home.display(), dest.display()))?;
+    if let Err(e) = app.store().rename_bot(bot, to) {
+        let _ = std::fs::rename(&dest, &home);
+        reload(app);
+        return Err(e.into());
+    }
+    info!(bot, to, "bot renamed");
+    reload(app);
+    runner::requeue_planned(app, to);
+    Ok(json!({ "renamed": bot, "to": to, "home": dest }))
 }
 
 async fn remove_bot(app: &Arc<App>, bot: &str, force: bool) -> anyhow::Result<Value> {

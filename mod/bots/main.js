@@ -6,6 +6,7 @@
 //   { chat: "<bot>" }  the same conversation as a window, for layouts without that panel
 //   { newBot: true }   the "new bot" dialog
 //   { deleteBot: id }  the "delete bot?" dialog
+//   { renameBot: id }  the "rename bot" dialog
 //   (none)             everything at once, as a window (`mod.open bots`)
 //
 // The daemon writes ~/.herdr-bots/state/status.json on every change; this mod watches that
@@ -116,6 +117,10 @@ function openDeleteBot(bot) {
   openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { deleteBot: bot.name, machine: bot.daemon.machine, key: bot.id } });
 }
 
+function openRenameBot(bot) {
+  openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { renameBot: bot.name, machine: bot.daemon.machine, key: bot.id } });
+}
+
 function openNewBot() {
   openOverlay({ mod: "bots", kind: "dialog", width: 420, props: { newBot: true } });
 }
@@ -123,11 +128,13 @@ function openNewBot() {
 export default class Bots extends View {
   init(_props, cx) {
     const p = props() ?? {};
-    this.mode = p.titlebar ? "titlebar" : p.newBot ? "new" : p.deleteBot ? "delete" : p.chat ? "chat" : p.sidebar ? "sidebar" : "full";
+    this.mode = p.titlebar ? "titlebar" : p.newBot ? "new" : p.deleteBot ? "delete" : p.renameBot ? "rename"
+      : p.chat ? "chat" : p.sidebar ? "sidebar" : "full";
     this.inPanel = p.chat === true; // follows shared "bots.chat" instead of a fixed bot
     if (this.mode === "titlebar") return; // a terminal window's title bar needs no data
     if (this.mode === "new") return this.initNew(cx);
     if (this.mode === "delete") return this.initDelete(cx);
+    if (this.mode === "rename") return this.initRename(cx);
     this.snap = null;
     this.error = null;
     this.selected = this.inPanel ? (shared("bots.chat") ?? null) : (p.chat ?? null);
@@ -247,6 +254,7 @@ export default class Bots extends View {
       case "chat": return this.renderChat(t);
       case "new": return this.renderNew(t);
       case "delete": return this.renderDelete(t);
+      case "rename": return this.renderRename(t);
       default: return this.renderFull(t);
     }
   }
@@ -308,7 +316,12 @@ export default class Bots extends View {
         .text_color(t.dim).hover((s) => s.bg(t.raised).text_color(t.blocked))
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => { cx.stop_propagation(); openDeleteBot(b); })
-        .child("Delete")));
+        .child("Delete")))
+      .when(hovered, (el) => el.child(div().id(`sb-ren-${b.id}`).flex_none().px(6).py(2).rounded(5).text_size(11)
+        .text_color(t.dim).hover((s) => s.bg(t.raised).text_color(t.foreground))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => { cx.stop_propagation(); openRenameBot(b); })
+        .child("Rename")));
   }
 
   // ---------- chat window ----------
@@ -326,7 +339,9 @@ export default class Bots extends View {
       .when(Boolean(bot), (el) => el.child(this.dot(t, bot.paused ? "paused" : bot.state)))
       // The name shortens before the buttons do (a machine label makes it long); the details
       // (agent · permission) go first, then the name is cut with an ellipsis.
-      .child(div().id("chat-name").flex_shrink_1().min_w(0).truncate().font_semibold().tooltip(bot ? this.label(bot) : "")
+      .child(div().id("chat-name").flex_shrink_1().min_w(0).truncate().font_semibold()
+        .when(Boolean(bot), (el) => el.cursor_pointer().hover((s) => s.text_color(t.accent))
+          .tooltip(`${this.label(bot)} · click to rename`).on_click(() => openRenameBot(bot)))
         .child(bot ? this.label(bot) : (this.selected ?? "Bots")))
       .child(div().flex_1().min_w(0).text_size(11).text_color(t.dim).truncate().child(bot ? `${bot.agent} · ${bot.permission}` : ""))
       .when(Boolean(bot), (el) => el
@@ -578,6 +593,54 @@ export default class Bots extends View {
         .child(div().id("del-yes").px(10).py(4).rounded(6).text_size(12).cursor_pointer().bg(t.blocked).text_color(t.background)
           .hover((s) => s.opacity(0.85)).on_click((_e, cx) => this.remove(cx))
           .child(this.busy ? "Deleting…" : "Delete")));
+  }
+
+  // ---------- rename bot dialog ----------
+
+  initRename(cx) {
+    this.target = props().renameBot;   // the daemon's own id for the bot
+    this.targetKey = props().key ?? this.target;
+    this.machine = props().machine ?? null;
+    this.busy = false;
+    this.error = null;
+    this.newName = InputState.new({ value: this.target, placeholder: this.target });
+    this.newName.on("submit", (_e, cx) => this.rename(cx));
+    this.newName.on("change", (_e, cx) => cx.notify());
+    this.handle = cx.focus_handle();
+    if (!checking()) cx.timer.after(150, () => this.newName.focus());
+  }
+
+  rename(cx) {
+    const to = this.newName.value().trim();
+    if (!BOT_ID.test(to)) { this.error = "Name: 1-24 of a-z 0-9 - _"; cx.notify(); return; }
+    if (to === this.target || this.busy) return;
+    this.busy = true;
+    cx.spawn(async (cx) => {
+      const list = await daemons();
+      const daemon = list.find((d) => d.machine === this.machine) ?? MAIN_DAEMON;
+      const r = await runOn(daemon, ["rename", this.target, to]);
+      this.busy = false;
+      if (r.code !== 0) { this.error = (r.stderr || r.stdout || "failed").trim(); cx.notify(); return; }
+      if (shared("bots.chat") === this.targetKey) setShared("bots.chat", botKey(daemon, to, list.length > 1));
+      closeOverlay(props().overlay);
+      notify({ title: `Renamed ${this.target} to ${to}`, body: "Its next turn starts a new session; MEMORY.md and SOUL.md stay.", level: "info" });
+    });
+  }
+
+  renderRename(t) {
+    const to = this.newName.value().trim();
+    const valid = BOT_ID.test(to) && to !== this.target;
+    return v_flex().id("bots-rename").track_focus(this.handle)
+      .on_key_down((e, cx) => { if (e.key === "escape") { closeOverlay(props().overlay); cx.stop_propagation(); } })
+      .w_full().p(18).gap(8).bg(t.popover).text_color(t.foreground)
+      .child(div().text_size(15).font_semibold().child(`Rename ${this.target}${this.machine ? ` on ${this.machine}` : ""}`))
+      .child(div().text_size(12.5).text_color(t.muted).whitespace_normal()
+        .child("Its folder, items and triggers follow. Its terminal ends, so the next turn starts a new session; SOUL.md and MEMORY.md stay. Not while it is on a turn."))
+      .child(Input.new(this.newName).h(34).px(10).rounded(8).border_1().border_color(t.input).bg(t.background).text_size(12.8))
+      .when(Boolean(this.error), (el) => el.child(div().text_size(11.5).text_color(t.blocked).whitespace_normal().child(this.error)))
+      .child(h_flex().pt(12).gap(8).justify_end()
+        .child(this.button(t, "ren-cancel", "Cancel", () => closeOverlay(props().overlay)))
+        .child(this.button(t, "ren-yes", this.busy ? "Renaming…" : "Rename", (cx) => this.rename(cx), valid)));
   }
 
   // ---------- new bot dialog ----------
