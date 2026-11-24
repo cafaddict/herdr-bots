@@ -53,9 +53,10 @@ async function loadDaemons() {
   } catch { /* a broken daemons.json leaves the main daemon alone */ }
   return list;
 }
-// Saving daemons.json reloads the mod, so one load per module is enough.
-let daemonsLoaded = null;
-const daemons = () => (daemonsLoaded ??= loadDaemons());
+// Each copy loads its own list. A promise shared between copies resumes every waiting copy
+// inside one copy's call, and a task or timer made there belongs to that copy: the other
+// copy then loads new data but redraws the wrong view.
+const daemons = () => loadDaemons();
 const stateDirOf = (d) => d.stateDir ?? `${home()}/.herdr-bots/state`;
 const readStatusOf = (d) => readTextFile(`${stateDirOf(d)}/status.json`, { on: d.machine }).catch(() => null);
 const runOn = (d, args) => exec(d.bin, args, { on: d.machine }).catch((e) => ({ code: 1, stderr: String(e) }));
@@ -252,18 +253,12 @@ export default class Bots extends View {
     // A paste with no text (a screenshot): save the clipboard image and attach it.
     this.input.on("paste_other", (_e, cx) => this.pasteImage(cx));
     if (checking()) return;
+    // Made here and not after an await, so the timer belongs to this view.
+    cx.timer.every(2000, (cx) => this.poll(cx));
     cx.spawn(async (cx) => {
       this.daemonList = await daemons();
       this.reload(cx);
       const local = this.daemonList.find((d) => !d.machine);
-      if (this.daemonList.some((d) => d.machine)) {
-        // watchFolder sees only this computer: read other machines' status files instead.
-        // reload() redraws only when something changed.
-        cx.timer.every(2000, (cx) => this.reload(cx));
-      } else {
-        // The folder may not exist until the daemon first starts; poll gently as a fallback.
-        cx.timer.every(15000, (cx) => this.reload(cx));
-      }
       if (local) {
         for (;;) {
           try { await watchFolder(stateDirOf(local)); } catch { await new Promise((r) => cx.timer.after(5000, r)); }
@@ -277,6 +272,15 @@ export default class Bots extends View {
   // One read at a time: a slow or unreachable machine would otherwise pile reads up on every
   // tick, and a late, older answer could overwrite a newer one. A change that lands while a
   // read is out gets one more read right after it.
+  // watchFolder sees only this computer, so other machines' status files are read every 2 s.
+  // With only a local daemon, every 16 s, for a state folder that appears after the first start.
+  // reload() redraws only when something changed.
+  poll(cx) {
+    if (!this.daemonList) return;
+    this.ticks = (this.ticks ?? 0) + 1;
+    if (this.daemonList.some((d) => d.machine) || this.ticks % 8 === 0) this.reload(cx);
+  }
+
   reload(cx) {
     if (this.loading) { this.reloadAgain = true; return; }
     this.loading = true;
